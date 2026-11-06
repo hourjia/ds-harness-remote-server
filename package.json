@@ -1,0 +1,28 @@
+{
+  "name": "ds-harness-remote-server",
+  "version": "0.6.3",
+  "description": "Self-hosted Relay/C signaling server for DeepSeek Harness Remote: device registration, WebRTC coordination, and end-to-end encrypted relay.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm --filter @dsh-remote/protocol build && pnpm --filter @dsh-remote/crypto build && pnpm --filter @dsh-remote/webrtc build && pnpm --filter @dsh-remote/server build",
+    "check": "pnpm -r check",
+    "test": "pnpm --filter @dsh-remote/server test",
+    "start": "pnpm --filter @dsh-remote/server start"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  },
+  "volta": {
+    "node": "24.22.2",
+    "pnpm": "9.15.4"
+  }
+}
