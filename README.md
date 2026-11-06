@@ -85,14 +85,26 @@ node --env-file=.env dist/main.js
 
 ## Docker
 
+推送到 `main` 或打 `v*` tag 后，GitHub Actions 自动构建并推送镜像到
+`ghcr.io/hourjia/ds-harness-remote-server`。在服务器上拉取预构建镜像部署：
+
 ```bash
 cd apps/server
 cp .env.example .env
 # 设置账号、密码、DSH_SERVER_PUBLIC_URL
-docker compose up -d --build
+docker compose -f compose.deploy.yaml pull
+docker compose -f compose.deploy.yaml up -d
 ```
 
-数据保存在 `server-data` 卷。预构建镜像：`ghcr.io/liguobao/ds-harness-remote/server:latest`。
+数据保存在 `server-data` 卷。生产环境建议在 `.env` 中把 `DSH_SERVER_IMAGE_TAG` 固定到
+具体版本（如 `0.6.3`）或 `sha-<commit>`，不要跟 `latest`。
+
+从源码本地构建仍可用：
+
+```bash
+cd apps/server
+docker compose up -d --build
+```
 
 > `DSH_SERVER_PUBLIC_URL` 必须与浏览器实际访问的 origin 完全一致（含协议、域名、非默认端口），否则 JS/CSS 会因 origin 校验返回 403 而白屏。
 

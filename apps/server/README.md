@@ -12,24 +12,37 @@ The `/` landing page links to `/app/login`; a successful sign-in continues to `/
 
 ## Docker deployment
 
+Pushes to `main` and `v*` tags make GitHub Actions build and publish an image to
+`ghcr.io/hourjia/ds-harness-remote-server`. To deploy on a server, pull the prebuilt image:
+
 ```bash
 cd apps/server
 cp .env.example .env
-# Edit .env: set your account, password, and public URL
+# Edit .env: set your account, password, and DSH_SERVER_PUBLIC_URL
+docker compose -f compose.deploy.yaml pull
+docker compose -f compose.deploy.yaml up -d
+```
+
+Tags: `latest` (current main), `main`, `0.6.3` (release), `0.6` (minor), and `sha-<commit>`.
+In production, pin `DSH_SERVER_IMAGE_TAG` in `.env` to a release or sha instead of tracking `latest`:
+
+```dotenv
+DSH_SERVER_IMAGE_TAG=0.6.3
+```
+
+You can still build from source instead:
+
+```bash
+cd apps/server
+cp .env.example .env
 docker compose up -d --build
 ```
 
 Open <http://localhost:8080>. Device credentials persist in the `server-data` volume. Stop the service with `docker compose down`.
 
-Public image: `ghcr.io/liguobao/ds-harness-remote/server:latest`. Pull it directly when needed:
-
-```bash
-docker pull ghcr.io/liguobao/ds-harness-remote/server:latest
-```
-
 If an older image fails to resolve `@dsh-remote/protocol`, update the source and rebuild with `docker compose build --no-cache server && docker compose up -d server`. The image explicitly includes the compiled protocol package and checks the Server import graph during the build. Rebuilding preserves the data volume.
 
-The GitHub Tag workflow builds the production image. Put an HTTPS reverse proxy in front of it instead of exposing the Node listener directly to the public internet.
+Put an HTTPS reverse proxy in front of the Server instead of exposing the Node listener directly to the public internet.
 
 ### Blank page or static assets returning 403
 

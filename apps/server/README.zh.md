@@ -12,24 +12,37 @@
 
 ## Docker 部署
 
+推送到 `main` 或打 `v*` tag 后，GitHub Actions 会自动构建并推送镜像到
+`ghcr.io/hourjia/ds-harness-remote-server`。在服务器上直接拉取预构建镜像部署：
+
 ```bash
 cd apps/server
 cp .env.example .env
-# 编辑 .env，设置账号、密码和访问地址
+# 编辑 .env：设置账号、密码和 DSH_SERVER_PUBLIC_URL
+docker compose -f compose.deploy.yaml pull
+docker compose -f compose.deploy.yaml up -d
+```
+
+镜像标签：`latest`（main 最新）、`main`、`0.6.3` 形式的版本号、`0.6` 次要版本、`sha-<commit>`。
+生产环境建议在 `.env` 里把 `DSH_SERVER_IMAGE_TAG` 固定到具体版本或 sha，不要跟 `latest`：
+
+```dotenv
+DSH_SERVER_IMAGE_TAG=0.6.3
+```
+
+也可以从源码本地构建：
+
+```bash
+cd apps/server
+cp .env.example .env
 docker compose up -d --build
 ```
 
 打开 <http://localhost:8080>。设备凭据保存在 `server-data` 卷；停止使用 `docker compose down`。
 
-公开镜像地址：`ghcr.io/liguobao/ds-harness-remote/server:latest`。需要时可以直接拉取：
-
-```bash
-docker pull ghcr.io/liguobao/ds-harness-remote/server:latest
-```
-
 若旧镜像启动时无法解析 `@dsh-remote/protocol`，更新源码后执行 `docker compose build --no-cache server && docker compose up -d server`。镜像显式包含 protocol 编译产物，并在构建阶段校验 Server 的模块加载；重建会保留数据卷。
 
-发布镜像由 GitHub Tag 工作流构建。生产环境应使用 HTTPS 反向代理，不要直接把 Node 监听端口暴露到公网。
+生产环境应使用 HTTPS 反向代理，不要直接把 Node 监听端口暴露到公网。
 
 ### 页面白屏或静态资源返回 403
 
