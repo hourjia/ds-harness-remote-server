@@ -50,11 +50,11 @@ docker compose -f compose.deploy.yaml pull
 docker compose -f compose.deploy.yaml up -d
 ```
 
-镜像标签：`latest`（main 最新）、`main`、`0.6.3` 形式的版本号、`0.6` 次要版本、`sha-<commit>`。
+镜像标签：`latest`（main 最新）、`main`、`0.7.0` 形式的版本号、`0.7` 次要版本、`sha-<commit>`。
 生产环境建议在 `.env` 里把 `DSH_SERVER_IMAGE_TAG` 固定到具体版本或 sha，不要跟 `latest`：
 
 ```dotenv
-DSH_SERVER_IMAGE_TAG=0.6.3
+DSH_SERVER_IMAGE_TAG=0.7.0
 ```
 
 也可以从源码本地构建：

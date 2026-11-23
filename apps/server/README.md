@@ -49,11 +49,11 @@ docker compose -f compose.deploy.yaml pull
 docker compose -f compose.deploy.yaml up -d
 ```
 
-Tags: `latest` (current main), `main`, `0.6.3` (release), `0.6` (minor), and `sha-<commit>`.
+Tags: `latest` (current main), `main`, `0.7.0` (release), `0.7` (minor), and `sha-<commit>`.
 In production, pin `DSH_SERVER_IMAGE_TAG` in `.env` to a release or sha instead of tracking `latest`:
 
 ```dotenv
-DSH_SERVER_IMAGE_TAG=0.6.3
+DSH_SERVER_IMAGE_TAG=0.7.0
 ```
 
 You can still build from source instead:

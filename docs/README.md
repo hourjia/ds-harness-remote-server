@@ -1,6 +1,6 @@
 # 文档
 
-本目录保留 DSH Remote 的**规范文档**，来源为上游 [`liguobao/ds-harness-remote`](https://github.com/liguobao/ds-harness-remote) 的 `docs/`，与上游 `v0.6.3` 一致。代码实现见 [`../apps/server`](../apps/server)，协议类型定义见 [`../packages/protocol/src/index.ts`](../packages/protocol/src/index.ts)。
+本目录保留 DSH Remote 的**规范文档**，来源为上游 [`liguobao/ds-harness-remote`](https://github.com/liguobao/ds-harness-remote) 的 `docs/`，按本仓库的 Server 范围做过删改。当前上游基线为 `v0.6.7`（`d026990`），见 [upstream-sync.md](./upstream-sync.md)。代码实现见 [`../apps/server`](../apps/server)，协议类型定义见 [`../packages/protocol/src/index.ts`](../packages/protocol/src/index.ts)。
 
 > 本仓库是上游 `apps/server` 的独立拆分，只包含 Server。上游 `docs/README.md` 中描述 Host 插件、Android/VS Code 客户端、Browser 扩展的部分已不适用，此处改写为面向 Server 与自定义客户端的索引。
 
@@ -25,6 +25,7 @@
 
 | 文档 | 内容 |
 |---|---|
+| [upstream-sync.md](./upstream-sync.md) | 上游基线（tag / commit）与每次同步的范围、明细 |
 | [plugin-integration.md](./plugin-integration.md) | Host 插件接入指南：注册、凭据、连接、allowlist 边界 |
 | [remote-tools.md](./remote-tools.md) | `remote_*` Agent 工具的语义与启用条件 |
 | [design/webrtc-control-recovery.md](./design/webrtc-control-recovery.md) | 可选增量契约 `transport.webrtc.resume.v1`：控制面恢复 |

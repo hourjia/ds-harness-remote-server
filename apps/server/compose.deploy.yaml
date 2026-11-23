@@ -7,7 +7,7 @@
 #   docker compose -f compose.deploy.yaml pull
 #   docker compose -f compose.deploy.yaml up -d
 #
-# Pin a release by setting DSH_SERVER_IMAGE_TAG (e.g. 0.6.3 or sha-abc1234)
+# Pin a release by setting DSH_SERVER_IMAGE_TAG (e.g. 0.7.0 or sha-abc1234)
 # instead of tracking latest.
 services:
   server:

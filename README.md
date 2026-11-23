@@ -21,7 +21,9 @@ Client（手机 / 桌面 / Web）─┘
 |---|---|
 | 上游 | `https://github.com/liguobao/ds-harness-remote` |
 | 本仓库 | 上游 `apps/server` + `packages/protocol` + 测试所需的 `crypto` / `webrtc` |
-| 版本基线 | 上游 `v0.6.7`（server 包版本 `0.5.21`，同步到 `d026990`） |
+| 本仓库版本 | `0.7.0`，独立自增，与上游版本解耦 |
+| 上游基线 | `v0.6.7` + 16 提交 = `d026990`（server 包版本 `0.5.21`） |
+| 同步记录 | 基线与每次同步明细见 [docs/upstream-sync.md](./docs/upstream-sync.md)；机器可读值在根 `package.json` 的 `upstream` 字段 |
 | 协议 | DSH Remote Protocol v1，见上游 `docs/protocol.md` |
 | 许可 | MIT，版权归 `DSH Remote contributors`，见 [LICENSE](./LICENSE) |
 
@@ -58,6 +60,7 @@ Client（手机 / 桌面 / Web）─┘
 │   ├── network.md        # 网络与传输、四路选路
 │   ├── end-to-end-encryption.md
 │   ├── compatibility.md
+│   ├── upstream-sync.md   # 上游同步基线与历史
 │   └── design/           # 增量契约与设计文档
 └── scripts/              # 测试辅助
 ```
@@ -100,7 +103,7 @@ docker compose -f compose.deploy.yaml up -d
 ```
 
 数据保存在 `server-data` 卷。生产环境建议在 `.env` 中把 `DSH_SERVER_IMAGE_TAG` 固定到
-具体版本（如 `0.6.3`）或 `sha-<commit>`，不要跟 `latest`。
+具体版本（如 `0.7.0`）或 `sha-<commit>`，不要跟 `latest`。
 
 从源码本地构建仍可用：
 
