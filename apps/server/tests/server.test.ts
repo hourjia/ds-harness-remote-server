@@ -1,9 +1,9 @@
 import { runScenarios, scenarioName } from '../../../scripts/test-scenarios.mjs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { randomUUID, createHmac } from 'node:crypto'
+import { createHash, randomUUID, createHmac, scryptSync } from 'node:crypto'
 import { once } from 'node:events'
 import { createConnection } from 'node:net'
 import { WebSocket } from 'ws'
@@ -39,10 +39,21 @@ async function request(path: string, method = 'GET', body?: unknown, token?: str
   const response = await fetch(`${base}/api/v1${path}`, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
   return { status: response.status, data: await response.json(), headers: response.headers }
 }
-async function start(pass = password, trustedProxyIps: readonly string[] = [], configOverrides: Partial<Config> = {}) {
-  app = createRemoteServer({ account, password: pass, dataFile: join(dir, 'state.json'), publicUrl: 'http://localhost:8080', trustedProxyIps, ...configOverrides })
+async function start(pass: string | undefined = password, trustedProxyIps: readonly string[] = [], configOverrides: Partial<Config> = {}) {
+  const common = { dataFile: join(dir, 'state.json'), publicUrl: 'http://localhost:8080', trustedProxyIps }
+  // `accounts` and the legacy single pair are mutually exclusive, so a
+  // multi-account test must not inherit the default account/password.
+  const config: Config = configOverrides.accounts
+    ? { ...common, ...configOverrides }
+    : { ...common, account, password: pass, ...configOverrides }
+  app = createRemoteServer(config)
   app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening')
   base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`
+}
+async function login(email = account, pass = password): Promise<string> {
+  const result = await request('/auth/login', 'POST', { email, password: pass })
+  expect(result.status).toBe(200)
+  return result.data.token
 }
 /** Send a raw HTTP/1.1 request so duplicate header lines stay separate (fetch merges them). */
 async function rawStatus(headerLines: string[]): Promise<number> {
@@ -70,10 +81,10 @@ async function rawStatus(headerLines: string[]): Promise<number> {
     socket.on('error', error => { clearTimeout(timer); reject(error) })
   })
 }
-async function device(role: 'host' | 'client' = 'client') {
+async function device(role: 'host' | 'client' = 'client', token = accountToken) {
   const keys = generateKeyPair()
   const descriptor = { deviceId: randomUUID(), identityKey: keys.publicKey, name: 'test-device', role, platform: 'linux', clientVersion: '0.4.15' }
-  const result = await request('/devices/register', 'POST', { v: 1, device: descriptor }, accountToken)
+  const result = await request('/devices/register', 'POST', { v: 1, device: descriptor }, token)
   expect(result.status).toBe(200)
   return { ...descriptor, keys, ...result.data }
 }
@@ -215,6 +226,113 @@ describe('account and device authorization', () => {
     const d = await device(); await app.close(); await start('a-different-password')
     expect((await request('/devices', 'GET', undefined, d.accessToken)).status).toBe(401)
     expect((await request('/auth/refresh', 'POST', { deviceId: d.deviceId, refreshToken: d.refreshToken })).status).toBe(401)
+  })
+})
+describe('multi-account isolation', () => {
+  const secondAccount = 'second@example.com', secondPassword = 'second-account-password'
+  const twoAccounts = () => start(undefined, [], {
+    accounts: [{ account, password }, { account: secondAccount, password: secondPassword }],
+  })
+
+  it('scopes listing, device details, rename and connections to the owning account', async () => {
+    await app.close()
+    await twoAccounts()
+    accountToken = await login()
+    const secondToken = await login(secondAccount, secondPassword)
+    const host = await device('host')
+    const foreignHost = await device('host', secondToken)
+    const foreignClient = await device('client', secondToken)
+    // Account-scoped listing: neither account sees the other's devices.
+    expect((await request('/account/devices', 'GET', undefined, secondToken)).data.items.map((item: { deviceId: string }) => item.deviceId))
+      .not.toContain(host.deviceId)
+    const sameAccountClient = await device('client')
+    const visible = (await request('/devices', 'GET', undefined, sameAccountClient.accessToken)).data.items
+    expect(visible.map((item: { deviceId: string }) => item.deviceId)).toContain(host.deviceId)
+    expect(visible.map((item: { deviceId: string }) => item.deviceId)).not.toContain(foreignHost.deviceId)
+    // Cross-account device reads and mutations are refused.
+    expect((await request(`/devices/${foreignHost.deviceId}`, 'GET', undefined, sameAccountClient.accessToken)).status).toBe(403)
+    expect((await request(`/devices/${foreignHost.deviceId}/presence`, 'GET', undefined, sameAccountClient.accessToken)).status).toBe(403)
+    expect((await request(`/devices/${host.deviceId}`, 'GET', undefined, foreignClient.accessToken)).status).toBe(403)
+    expect((await request(`/devices/${host.deviceId}/name`, 'POST', { name: 'stolen-host' }, secondToken)).status).toBe(403)
+    // A device identity cannot be claimed or transferred to another account.
+    const hijack = await request('/devices/register', 'POST', {
+      v: 1,
+      device: { deviceId: host.deviceId, name: 'hijack', role: 'host', platform: 'linux', identityKey: generateKeyPair().publicKey, clientVersion: '0.4.15' },
+    }, secondToken)
+    expect(hijack.status).toBe(409)
+    expect(hijack.data.error.code).toBe('PEER_IDENTITY_MISMATCH')
+    // Opposite-role registration inherits the source device's owner.
+    const ownedRoleId = randomUUID()
+    expect((await request('/devices/register-owned-role', 'POST', {
+      v: 1,
+      device: { deviceId: ownedRoleId, name: 'owned-role', role: 'client', platform: 'linux', identityKey: generateKeyPair().publicKey, clientVersion: '0.4.15' },
+    }, host.accessToken)).status).toBe(200)
+    expect((await request('/account/devices', 'GET', undefined, secondToken)).data.items.map((item: { deviceId: string }) => item.deviceId))
+      .not.toContain(ownedRoleId)
+    // A foreign Client cannot open a link; a same-account Client still can.
+    const hostWire = await socket(host)
+    await hostWire.next('hello.ack')
+    const foreignWire = await socket(foreignClient)
+    await foreignWire.next('hello.ack')
+    foreignWire.send('connect.request', { hostDeviceId: host.deviceId, preferredTransports: ['relay'] })
+    expect((await foreignWire.next('error')).code).toBe('MEMBERSHIP_REQUIRED')
+    hostWire.send('ping', { nonce: 'isolation-check' })
+    await hostWire.next('pong')
+    expect(hostWire.messages.filter(message => message.type === 'connect.incoming')).toHaveLength(0)
+    const sameWire = await socket(sameAccountClient)
+    await sameWire.next('hello.ack')
+    sameWire.send('connect.request', { hostDeviceId: host.deviceId, preferredTransports: ['relay'] })
+    expect((await hostWire.next('connect.incoming')).clientDeviceId).toBe(sameAccountClient.deviceId)
+  })
+
+  it('revokes credentials per account when a password changes or an account is removed', async () => {
+    await app.close()
+    await twoAccounts()
+    const ownerToken = await login()
+    const secondToken = await login(secondAccount, secondPassword)
+    const ownerDevice = await device('client', ownerToken)
+    const secondDevice = await device('client', secondToken)
+    // Changing one account's password must not sign out the other account.
+    await app.close()
+    await start(undefined, [], { accounts: [{ account, password: 'changed-owner-password' }, { account: secondAccount, password: secondPassword }] })
+    expect((await request('/devices', 'GET', undefined, ownerDevice.accessToken)).status).toBe(401)
+    expect((await request('/devices', 'GET', undefined, secondDevice.accessToken)).status).toBe(200)
+    expect((await request('/auth/login', 'POST', { email: account, password })).status).toBe(401)
+    expect((await request('/auth/login', 'POST', { email: account, password: 'changed-owner-password' })).status).toBe(200)
+    expect((await request('/auth/login', 'POST', { email: secondAccount, password: secondPassword })).status).toBe(200)
+    // Removing an account from the configuration disables it and drops its tokens.
+    await app.close()
+    await start(undefined, [], { accounts: [{ account, password: 'changed-owner-password' }] })
+    expect((await request('/auth/login', 'POST', { email: secondAccount, password: secondPassword })).status).toBe(401)
+    expect((await request('/devices', 'GET', undefined, secondDevice.accessToken)).status).toBe(401)
+  })
+
+  it('migrates a v1 state file without losing registered devices', async () => {
+    await app.close()
+    const salt = randomUUID().replaceAll('-', '')
+    const verifier = scryptSync(password, salt, 32).toString('hex')
+    const descriptor = {
+      deviceId: randomUUID(), identityKey: generateKeyPair().publicKey, name: 'legacy-device',
+      role: 'client' as const, platform: 'linux', clientVersion: '0.4.15',
+    }
+    const accessToken = 'legacy-access-token'
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({
+      version: 1,
+      account,
+      salt,
+      verifier,
+      devices: { [descriptor.deviceId]: { descriptor, revoked: false, lastSeenAt: 0 } },
+      tokens: {
+        [createHash('sha256').update(accessToken).digest('hex')]: { kind: 'access', deviceId: descriptor.deviceId, expires: Date.now() + 3600_000, used: false },
+      },
+    }))
+    await start()
+    expect((await request('/devices', 'GET', undefined, accessToken)).status).toBe(200)
+    expect(existsSync(join(dir, 'state.json.v1.bak'))).toBe(true)
+    const migrated = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
+    expect(migrated.version).toBe(2)
+    expect(migrated.devices[descriptor.deviceId].owner).toBe(account)
+    expect((await request('/auth/login', 'POST', { email: account, password })).status).toBe(200)
   })
 })
 describe('control authorization and encrypted relay', () => {

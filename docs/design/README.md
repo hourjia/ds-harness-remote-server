@@ -16,6 +16,7 @@
 | [Plugin 功能设计](plugin/functional-design.md) | 生命周期、数据面、allowlist、工具与恢复 |
 | [共享基础](shared-foundation.md) | 身份、授权、加密、传输和共享包职责 |
 | [协议 Schema 对齐](protocol-schema-alignment.md) | schema、fixtures、版本与验证边界 |
+| [多账号](multi-account.md) | 自部署 Server 的环境变量多账号、owner 隔离、v1 迁移与限制 |
 | [CodeX 内存展示投影](codex-session-history-projection-prompt.md) | App Server authority、原生 UI 载体与生命周期 |
 | [OpenCode 原生归档](acp-session-archive.md) | 直接调用原生 HTTP API、能力协商、跨连接目录同步及并发边界；不含恢复 |
 
@@ -28,8 +29,8 @@
 - Android：账号授权、Host / Workspace / Session / Chat、图片 Prompt、历史恢复、工作区快捷入口，以及按后端能力接入的会话工具。
 - VS Code：账号授权、Host 信任固定、Harness 工作区/会话导航、Prompt 与基础审批；实时更新和恢复仍有待办。
 - Browser 扩展：只换取独立设备凭据、显示在线 Host、打开同源 Remote Web。
-- `apps/server`：可自部署的单账号、文件持久化 Server，支持可配置的 WebRTC LAN/P2P/TURN 与加密 Relay，提供登录与设备状态页和 Docker 部署入口。
-- 完整多账号 Server、Remote Web 会话 UI、Admin 及其数据库、队列和部署基础设施由独立仓库实现。
+- `apps/server`：可自部署的多账号（环境变量预置）、文件持久化 Server，支持可配置的 WebRTC LAN/P2P/TURN 与加密 Relay，提供登录与设备状态页和 Docker 部署入口。
+- 完整多账号 Server（自助注册、Admin、SQLite 及其队列和部署基础设施）由独立仓库实现；本仓库只实现环境变量预置的账号与 owner 隔离。
 
 ## 数据面与领域
 

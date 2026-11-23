@@ -1,8 +1,9 @@
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { accountDeviceDescriptorSchema, type AccountDeviceDescriptor } from '@dsh-remote/protocol'
 import { z } from 'zod'
+import type { AccountSeed } from './accounts.js'
 
 export class ApiError extends Error {
   constructor(readonly code: string, readonly status = 400) { super(code) }
@@ -10,24 +11,97 @@ export class ApiError extends Error {
 export const hash = (value: string): string => createHash('sha256').update(value).digest('hex')
 export const secret = (): string => randomBytes(32).toString('base64url')
 export const equal = (left: string, right: string): boolean => timingSafeEqual(Buffer.from(hash(left)), Buffer.from(hash(right)))
-const tokenSchema = z.object({ kind: z.enum(['access', 'refresh']), deviceId: z.string(), expires: z.number(), used: z.boolean() })
-const savedDeviceSchema = z.object({ descriptor: accountDeviceDescriptorSchema, revoked: z.boolean(), lastSeenAt: z.number() })
-const stateSchema = z.object({ version: z.literal(1), account: z.string(), salt: z.string(), verifier: z.string(), devices: z.record(z.string(), savedDeviceSchema), tokens: z.record(z.string(), tokenSchema) })
-type SavedDevice = z.infer<typeof savedDeviceSchema>
 
-/** Single-process store. Only token digests and public identities reach disk. */
+export type { AccountSeed }
+
+/** Per-account device quota; a single deployment-wide cap still applies below. */
+export const MAX_DEVICES_PER_ACCOUNT = 128
+export const MAX_DEVICES_TOTAL = 4096
+export const MAX_TOKENS_TOTAL = 65536
+/** Burned for an unknown account so login timing cannot confirm account existence. */
+const DUMMY_SALT = 'dsh-remote-unknown-account-v1'
+
+const tokenSchema = z.object({ kind: z.enum(['access', 'refresh']), deviceId: z.string(), expires: z.number(), used: z.boolean() })
+const accountRecordSchema = z.object({
+  salt: z.string(),
+  verifier: z.string(),
+  createdAt: z.number(),
+  disabled: z.boolean(),
+})
+const savedDeviceSchema = z.object({
+  owner: z.string(),
+  descriptor: accountDeviceDescriptorSchema,
+  revoked: z.boolean(),
+  lastSeenAt: z.number(),
+})
+/** v1 kept one account for the whole file and no owner on devices. */
+const legacyDeviceSchema = z.object({
+  descriptor: accountDeviceDescriptorSchema,
+  revoked: z.boolean(),
+  lastSeenAt: z.number(),
+})
+const legacyStateSchema = z.object({
+  version: z.literal(1),
+  account: z.string(),
+  salt: z.string(),
+  verifier: z.string(),
+  devices: z.record(z.string(), legacyDeviceSchema),
+  tokens: z.record(z.string(), tokenSchema),
+})
+const stateSchema = z.object({
+  version: z.literal(2),
+  accounts: z.record(z.string(), accountRecordSchema),
+  devices: z.record(z.string(), savedDeviceSchema),
+  tokens: z.record(z.string(), tokenSchema),
+})
+type State = z.infer<typeof stateSchema>
+export type SavedDevice = z.infer<typeof savedDeviceSchema>
+
+/**
+ * Single-process, multi-account store. Only token digests, account verifiers
+ * (scrypt over a per-account salt) and public identities reach disk.
+ *
+ * Access boundaries are implicit but strict: a Client may only see and connect
+ * to Hosts whose `owner` equals its own. Accounts absent from the startup
+ * configuration are disabled, and their tokens are revoked, so the environment
+ * remains the single source of truth for who may sign in.
+ */
 export class Store {
-  private state: z.infer<typeof stateSchema>
+  private state: State
   onInvalidate: (id: string) => void = () => {}
-  constructor(private readonly file: string, readonly account: string, password: string) {
-    const previous = existsSync(file) ? stateSchema.parse(JSON.parse(readFileSync(file, 'utf8'))) : undefined
-    const salt = previous?.salt ?? secret()
-    const verifier = scryptSync(password, salt, 32).toString('hex')
-    this.state = previous ?? { version: 1, account, salt, verifier, devices: {}, tokens: {} }
-    if (this.state.account !== account) this.state.devices = {}
-    if (this.state.account !== account || !equal(this.state.verifier, verifier)) this.state.tokens = {}
-    Object.assign(this.state, { account, verifier })
+  constructor(private readonly file: string, seeds: readonly AccountSeed[]) {
+    if (seeds.length === 0) throw new Error('At least one account is required.')
+    this.state = this.read() ?? { version: 2, accounts: {}, devices: {}, tokens: {} }
+    this.syncAccounts(seeds)
     this.save()
+  }
+  private read(): State | undefined {
+    if (!existsSync(this.file)) return undefined
+    const parsed: unknown = JSON.parse(readFileSync(this.file, 'utf8'))
+    if (parsed !== null && typeof parsed === 'object' && (parsed as { version?: unknown }).version === 1) {
+      return this.migrate(legacyStateSchema.parse(parsed))
+    }
+    return stateSchema.parse(parsed)
+  }
+  /** v1 → v2: the single account becomes an entry and every device inherits it. */
+  private migrate(legacy: z.infer<typeof legacyStateSchema>): State {
+    // A v1 process cannot read a v2 file, so keep a rollback copy before the
+    // first write. Best effort: a failed backup must not block the migration.
+    try {
+      if (!existsSync(`${this.file}.v1.bak`)) copyFileSync(this.file, `${this.file}.v1.bak`)
+    } catch {
+      // Backup is advisory only.
+    }
+    const devices: State['devices'] = {}
+    for (const [id, device] of Object.entries(legacy.devices)) devices[id] = { owner: legacy.account, ...device }
+    return {
+      version: 2,
+      accounts: {
+        [legacy.account]: { salt: legacy.salt, verifier: legacy.verifier, createdAt: Date.now(), disabled: false },
+      },
+      devices,
+      tokens: legacy.tokens,
+    }
   }
   private save(): void {
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
@@ -35,25 +109,79 @@ export class Store {
     writeFileSync(tmp, JSON.stringify(this.state), { mode: 0o600 })
     renameSync(tmp, this.file)
   }
+  /**
+   * Reconcile configured accounts with the persisted file: add new accounts,
+   * re-derive verifiers with the stored salt, revoke credentials when an
+   * account's password changed, and disable accounts no longer configured.
+   */
+  private syncAccounts(seeds: readonly AccountSeed[]): void {
+    const now = Date.now()
+    const configured = new Set<string>()
+    for (const seed of seeds) {
+      const previous = this.state.accounts[seed.account]
+      const salt = previous?.salt ?? secret()
+      const verifier = scryptSync(seed.password, salt, 32).toString('hex')
+      if (previous && !equal(previous.verifier, verifier)) this.revokeAccountTokens(seed.account)
+      this.state.accounts[seed.account] = { salt, verifier, createdAt: previous?.createdAt ?? now, disabled: false }
+      configured.add(seed.account)
+    }
+    for (const [account, record] of Object.entries(this.state.accounts)) {
+      if (configured.has(account) || record.disabled) continue
+      record.disabled = true
+      this.revokeAccountTokens(account)
+    }
+  }
+  /** Drop every token belonging to one account, without touching other accounts. */
+  private revokeAccountTokens(account: string): void {
+    for (const [key, token] of Object.entries(this.state.tokens)) {
+      const device = this.state.devices[token.deviceId]
+      if (!device || device.owner === account) delete this.state.tokens[key]
+    }
+  }
+  /**
+   * Constant-work credential check: an unknown or disabled account still pays
+   * for one scrypt round, so timing cannot be used to enumerate accounts.
+   */
+  verify(account: string, password: string): boolean {
+    const record = this.state.accounts[account]
+    if (!record || record.disabled) {
+      scryptSync(password, DUMMY_SALT, 32)
+      return false
+    }
+    return equal(record.verifier, scryptSync(password, record.salt, 32).toString('hex'))
+  }
   get(id: string): SavedDevice {
     const d = Object.hasOwn(this.state.devices, id) ? this.state.devices[id] : undefined
     if (!d) throw new ApiError('DEVICE_NOT_FOUND', 404)
     if (d.revoked) throw new ApiError('DEVICE_REVOKED', 403)
+    const account = this.state.accounts[d.owner]
+    if (!account || account.disabled) throw new ApiError('DEVICE_REVOKED', 403)
     return d
   }
-  list(): SavedDevice[] { return Object.values(this.state.devices).filter(d => !d.revoked) }
-  register(descriptor: AccountDeviceDescriptor): ReturnType<Store['issue']> {
+  list(owner: string): SavedDevice[] {
+    return Object.values(this.state.devices).filter(d => !d.revoked && d.owner === owner)
+  }
+  register(descriptor: AccountDeviceDescriptor, owner: string): ReturnType<Store['issue']> {
+    const account = this.state.accounts[owner]
+    if (!account || account.disabled) throw new ApiError('AUTH_INVALID', 401)
     const old = this.state.devices[descriptor.deviceId]
     if (old?.revoked) throw new ApiError('DEVICE_REVOKED', 403)
+    // A device identity belongs to exactly one account for its lifetime: a
+    // second account re-registering the same deviceId is a conflict, not a
+    // transfer.
+    if (old && old.owner !== owner) throw new ApiError('PEER_IDENTITY_MISMATCH', 409)
     if (old && (old.descriptor.identityKey !== descriptor.identityKey || old.descriptor.role !== descriptor.role)) throw new ApiError('PEER_IDENTITY_MISMATCH', 409)
-    if (!old && Object.keys(this.state.devices).length >= 256) throw new ApiError('RATE_LIMITED', 429)
-    this.state.devices[descriptor.deviceId] = { descriptor, revoked: false, lastSeenAt: old?.lastSeenAt ?? 0 }
+    if (!old) {
+      const owned = Object.values(this.state.devices).filter(d => d.owner === owner).length
+      if (owned >= MAX_DEVICES_PER_ACCOUNT || Object.keys(this.state.devices).length >= MAX_DEVICES_TOTAL) throw new ApiError('RATE_LIMITED', 429)
+    }
+    this.state.devices[descriptor.deviceId] = { owner, descriptor, revoked: false, lastSeenAt: old?.lastSeenAt ?? 0 }
     this.invalidate(descriptor.deviceId)
     return this.issue(descriptor.deviceId)
   }
   private issue(deviceId: string, refreshTokenExpiresAt = Date.now() + 30 * 86400_000) {
     for (const [key, value] of Object.entries(this.state.tokens)) if (value.expires <= Date.now()) delete this.state.tokens[key]
-    if (Object.keys(this.state.tokens).length >= 16384) throw new ApiError('RATE_LIMITED', 429)
+    if (Object.keys(this.state.tokens).length >= MAX_TOKENS_TOTAL) throw new ApiError('RATE_LIMITED', 429)
     const accessToken = secret(), refreshToken = secret()
     const accessTokenExpiresAt = Date.now() + 60 * 60_000
     this.state.tokens[hash(accessToken)] = { kind: 'access', deviceId, expires: accessTokenExpiresAt, used: false }
@@ -82,8 +210,10 @@ export class Store {
     this.save()
   }
   revoke(id: string): void { this.get(id).revoked = true; this.invalidate(id) }
-  rename(id: string, name: string): void {
-    this.get(id).descriptor.name = name
+  rename(owner: string, id: string, name: string): void {
+    const device = this.get(id)
+    if (device.owner !== owner) throw new ApiError('MEMBERSHIP_REQUIRED', 403)
+    device.descriptor.name = name
     this.save()
   }
   touch(id: string, clientVersion?: string, harnessVersion?: string): void {

@@ -6,7 +6,8 @@ import { randomUUID } from 'node:crypto'
 import { isIP } from 'node:net'
 import { z } from 'zod'
 import { deviceRegistrationRequestSchema, deviceRefreshRequestSchema } from '@dsh-remote/protocol'
-import { ApiError, Store, equal, hash, secret } from './store.js'
+import { ApiError, Store, hash, secret, type AccountSeed, type SavedDevice } from './store.js'
+import { resolveAccountSeeds } from './accounts.js'
 import { Gateway } from './gateway.js'
 import { buildIceServers, parseIceConfig, type IceConfig } from './ice.js'
 import { Logger, type LogLevel } from './logger.js'
@@ -23,8 +24,10 @@ import {
 } from './config.js'
 
 export interface Config {
-  account: string
-  password: string
+  /** Multi-account credentials; mutually exclusive with `account`/`password`. */
+  accounts?: readonly AccountSeed[]
+  account?: string
+  password?: string
   dataFile: string
   publicUrl: string
   trustedProxyIps?: readonly string[]
@@ -152,14 +155,14 @@ export function clientAddress(req: IncomingMessage, trustedProxyIps: ReadonlySet
   return forwarded
 }
 export function createRemoteServer(config: Config) {
-  if (!config.account.trim() || config.password.length < 12) throw new Error('DSH_SERVER_ACCOUNT and DSH_SERVER_PASSWORD (at least 12 characters) are required.')
+  const seeds = resolveAccountSeeds(config)
   const url = new URL(config.publicUrl)
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('DSH_SERVER_PUBLIC_URL must be an HTTP(S) origin.')
   const trustedProxyIps = normalizeTrustedProxyIps(config.trustedProxyIps)
   const ice = config.ice ?? parseIceConfig({})
-  const store = new Store(config.dataFile, config.account.trim(), config.password)
+  const store = new Store(config.dataFile, seeds)
   const assets = readAssets()
-  const sessions = new Map<string, number>()
+  const sessions = new Map<string, { account: string; expiresAt: number }>()
   const limits = new Map<string, { count: number; until: number }>()
   function rate(key: string, max: number) {
     for (const [k, v] of limits) if (v.until < Date.now()) limits.delete(k)
@@ -172,16 +175,18 @@ export function createRemoteServer(config: Config) {
     if (authorization) return authorization.startsWith('Bearer ') ? authorization.slice(7) : ''
     return /(?:^|;\s*)dsh_session=([A-Za-z0-9_-]+)/.exec(req.headers.cookie ?? '')?.[1] ?? ''
   }
-  function accountAuth(req: IncomingMessage) {
+  function accountAuth(req: IncomingMessage): string {
     const key = hash(token(req))
-    if ((sessions.get(key) ?? 0) <= Date.now()) { sessions.delete(key); throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401) }
+    const session = sessions.get(key)
+    if (!session || session.expiresAt <= Date.now()) { sessions.delete(key); throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401) }
+    return session.account
   }
   function deviceAuth(req: IncomingMessage) {
     if (!req.headers.authorization?.startsWith('Bearer ')) throw new ApiError('AUTH_REQUIRED', 401)
     return store.authenticate(req.headers.authorization.slice(7))
   }
   function cookie(value: string, age: number): string { return `dsh_session=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${url.protocol === 'https:' ? '; Secure' : ''}` }
-  const profile = () => ({ account: store.account, profile: { displayName: store.account }, isAdmin: false })
+  const profile = (account: string) => ({ account, profile: { displayName: account }, isAdmin: false })
   const server = createServer({ requestTimeout: 15000, headersTimeout: 10000 }, (req, res) => {
     res.setHeader('Cache-Control', 'no-store')
     res.setHeader('X-Content-Type-Options', 'nosniff')
@@ -209,8 +214,8 @@ export function createRemoteServer(config: Config) {
     logger: logger.child('gateway'),
     turnEnabled: ice.turnUrls.length > 0,
   })
-  function descriptor(d: ReturnType<Store['get']>) {
-    return { ...d.descriptor, membershipId: `account:${hash(store.account).slice(0, 16)}`, online: gateway.peers.has(d.descriptor.deviceId), lastSeenAt: d.lastSeenAt }
+  function descriptor(d: SavedDevice) {
+    return { ...d.descriptor, membershipId: `account:${hash(d.owner).slice(0, 16)}`, online: gateway.peers.has(d.descriptor.deviceId), lastSeenAt: d.lastSeenAt }
   }
   async function route(req: IncomingMessage, res: ServerResponse) {
     const requestUrl = new URL(req.url ?? '/', url)
@@ -237,27 +242,34 @@ export function createRemoteServer(config: Config) {
     if (method === 'POST' && path === '/api/v1/auth/login') {
       rate(`login:${client}`, 20)
       const credentials = loginSchema.parse(await body(req))
-      if (!equal(credentials.email.trim(), store.account) || !equal(credentials.password, config.password)) throw new ApiError('AUTH_INVALID', 401)
-      for (const [key, expires] of sessions) if (expires <= Date.now()) sessions.delete(key)
-      if (sessions.size >= 256) throw new ApiError('RATE_LIMITED', 429)
+      const account = credentials.email.trim()
+      // Unknown, disabled and wrong-password all take one scrypt round and
+      // return the same code, so login cannot be used to enumerate accounts.
+      if (!store.verify(account, credentials.password)) throw new ApiError('AUTH_INVALID', 401)
+      for (const [key, session] of sessions) if (session.expiresAt <= Date.now()) sessions.delete(key)
+      if (sessions.size >= 4096) throw new ApiError('RATE_LIMITED', 429)
       const value = secret(), expiresAt = Date.now() + 8 * 3600_000
-      sessions.set(hash(value), expiresAt)
+      sessions.set(hash(value), { account, expiresAt })
       res.setHeader('Set-Cookie', cookie(value, 8 * 3600))
-      json(res, 200, { ...profile(), token: value, expiresAt }); return
+      json(res, 200, { ...profile(account), token: value, expiresAt }); return
     }
-    if (method === 'GET' && path === '/api/v1/auth/me') { accountAuth(req); json(res, 200, profile()); return }
+    if (method === 'GET' && path === '/api/v1/auth/me') { json(res, 200, profile(accountAuth(req))); return }
     if (method === 'POST' && path === '/api/v1/auth/logout') {
       sessions.delete(hash(token(req))); res.setHeader('Set-Cookie', cookie('', 0)); json(res, 200, { status: 'ok' }); return
     }
     if (method === 'GET' && path === '/api/v1/account/devices') {
-      accountAuth(req); json(res, 200, { items: store.list().map(descriptor), serverUrl: url.origin, transport: 'webrtc' }); return
+      const account = accountAuth(req)
+      json(res, 200, { items: store.list(account).map(descriptor), serverUrl: url.origin, transport: 'webrtc' }); return
     }
     if (method === 'POST' && (path === '/api/v1/devices/register' || path === '/api/v1/devices/register-owned-role')) {
       const source = path.endsWith('register-owned-role') ? deviceAuth(req) : undefined
-      if (!source) accountAuth(req)
+      // A new device always inherits the credential owner: the logged-in
+      // account for a fresh registration, the existing device's owner for the
+      // opposite-role registration path.
+      const owner = source ? source.owner : accountAuth(req)
       const { device } = deviceRegistrationRequestSchema.parse(await body(req))
       if (source && (source.descriptor.deviceId === device.deviceId || source.descriptor.role === device.role)) throw new ApiError('INVALID_MESSAGE', 409)
-      json(res, 200, store.register(device)); return
+      json(res, 200, store.register(device, owner)); return
     }
     if (method === 'POST' && path === '/api/v1/auth/refresh') {
       const data = deviceRefreshRequestSchema.parse(await body(req))
@@ -277,7 +289,7 @@ export function createRemoteServer(config: Config) {
     if (method === 'GET' && path === '/api/v1/devices') {
       const source = deviceAuth(req)
       if (source.descriptor.role !== 'client') throw new ApiError('MEMBERSHIP_REQUIRED', 403)
-      const items = store.list().filter(d => d.descriptor.role === 'host').map(d => {
+      const items = store.list(source.owner).filter(d => d.descriptor.role === 'host').map(d => {
         const { identityKey: _key, ...item } = descriptor(d)
         return item
       })
@@ -285,15 +297,17 @@ export function createRemoteServer(config: Config) {
     }
     const renameMatch = /^\/api\/v1\/devices\/([^/]+)\/name$/.exec(path)
     if (method === 'POST' && renameMatch) {
-      accountAuth(req)
+      const account = accountAuth(req)
       const { name } = z.object({ name: z.string().trim().min(1).max(80) }).parse(await body(req))
-      store.rename(renameMatch[1]!, name)
+      store.rename(account, renameMatch[1]!, name)
       json(res, 200, descriptor(store.get(renameMatch[1]!))); return
     }
     const match = /^\/api\/v1\/devices\/([^/]+)(\/presence)?$/.exec(path)
     if (method === 'GET' && match) {
       const source = deviceAuth(req), target = store.get(match[1]!)
-      if (source.descriptor.role === target.descriptor.role) throw new ApiError('MEMBERSHIP_REQUIRED', 403)
+      // Membership is ownership: same account, opposite role. Cross-account
+      // requests must look exactly like requests for a device you may not use.
+      if (source.owner !== target.owner || source.descriptor.role === target.descriptor.role) throw new ApiError('MEMBERSHIP_REQUIRED', 403)
       const d = descriptor(target)
       json(res, 200, match[2] ? { deviceId: d.deviceId, online: d.online, lastSeenAt: d.lastSeenAt } : d); return
     }

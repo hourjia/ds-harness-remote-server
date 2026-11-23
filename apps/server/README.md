@@ -2,13 +2,33 @@
 
 **English** · [中文](README.zh.md)
 
-A single-account Remote Server with WebRTC (LAN / P2P / TURN) and end-to-end encrypted Relay, configured through environment variables. Its Web UI includes a landing page, sign-in, and device status page. The Server is deployed separately from the Host plugin bundle.
+A multi-account Remote Server with WebRTC (LAN / P2P / TURN) and end-to-end encrypted Relay, configured through environment variables. Hosts and Clients on the same account can see and reach each other; different accounts are fully isolated. Its Web UI includes a landing page, sign-in, and device status page. The Server is deployed separately from the Host plugin bundle.
 
 This remains a small self-hosted Server that we intend to maintain. The product shape of the full Server Web is still evolving, so this repository does not promise to open source the current or future full site.
 
 ## Self-hosted Web flow
 
-The `/` landing page links to `/app/login`; a successful sign-in continues to `/app/remote`. Point both Host and Client at the same Server URL and use the same account and password. Device credentials are persisted by the Server, while Web sessions use an HttpOnly cookie.
+The `/` landing page links to `/app/login`; a successful sign-in continues to `/app/remote`, which lists only the devices owned by the signed-in account. Point both Host and Client at the same Server URL and sign in with the **same account**. Device credentials are persisted by the Server, while Web sessions use an HttpOnly cookie.
+
+## Multiple accounts
+
+The default stays single-account: set `DSH_SERVER_ACCOUNT` + `DSH_SERVER_PASSWORD` and behavior is unchanged.
+
+For multiple users, configure a list (mutually exclusive with the legacy pair):
+
+```dotenv
+DSH_SERVER_ACCOUNTS=owner@example.com:first-long-password,teammate@example.com:second-long-password
+```
+
+- Separate entries with commas or newlines. Only the **first** colon splits the account from the password, so passwords may contain colons but not commas or newlines; use the JSON file otherwise.
+- `DSH_SERVER_ACCOUNTS_FILE` points at a JSON array `[{"account":"a@example.com","password":"..."}]`. Mount that file into the container yourself when deploying with Docker.
+- Each password must be at least 12 characters; accounts must be unique.
+- Isolation: a Client can only list, inspect, rename, connect to and relay through Hosts owned by its own account. Cross-account device details, presence, renames, `connect.request` and TURN credentials are refused.
+- Changing one account's password revokes only that account's device credentials.
+- Removing an account from the configuration disables it on the next start and revokes its device tokens; device records are kept, so re-adding the account restores access without re-registration.
+- Accounts are synced from the environment at startup only; restart after changing them (`docker compose up -d --force-recreate server` for containers).
+- A v1 single-account `state.json` is migrated automatically on first start, with a `state.json.v1.bak` backup.
+- Each account is capped at 128 devices by default. Invite-code registration, organizations/RBAC and an admin console are not included.
 
 ## Docker deployment
 
@@ -69,7 +89,7 @@ pnpm --filter @dsh-remote/server build
 cp apps/server/.env.example apps/server/.env
 ```
 
-Edit `apps/server/.env` with your account and a password of at least 12 characters, then start:
+Edit `apps/server/.env` with your account and a password of at least 12 characters (or use `DSH_SERVER_ACCOUNTS` for multiple accounts), then start:
 
 ```bash
 cd apps/server
@@ -80,8 +100,10 @@ Open <http://localhost:8080>. Set the same Server URL on your Host and Client, t
 
 | Variable | Purpose / default |
 | --- | --- |
-| `DSH_SERVER_ACCOUNT` | Required login account |
-| `DSH_SERVER_PASSWORD` | Required; at least 12 characters |
+| `DSH_SERVER_ACCOUNT` | Login account for a single-account deployment; mutually exclusive with `DSH_SERVER_ACCOUNTS` |
+| `DSH_SERVER_PASSWORD` | Single-account password; at least 12 characters |
+| `DSH_SERVER_ACCOUNTS` | Comma- or newline-separated `account:password` list; mutually exclusive with the pair above |
+| `DSH_SERVER_ACCOUNTS_FILE` | Path to a JSON array `[{"account","password"}]`; may be combined with `DSH_SERVER_ACCOUNTS` |
 | `DSH_SERVER_PUBLIC_URL` | Browser-facing URL; default `http://localhost:8080` |
 | `DSH_SERVER_HOST` | Listen / port-binding address; default `127.0.0.1`, use `0.0.0.0` for LAN access |
 | `DSH_SERVER_PORT` | Default `8080` |
@@ -128,7 +150,8 @@ Apply the change with `docker compose up -d --force-recreate server`; `docker co
 ## Features
 
 - Device registration, credential refresh, device discovery, Control, WebRTC LAN/P2P/TURN coordination, and end-to-end encrypted Relay.
-- Single-process operation with persistent data. Device credentials survive restarts; Web users sign in again. Changing the password requires devices to reauthorize.
+- Multi-account support configured through the environment: accounts are isolated, so cross-account device queries, renames, connections and TURN credentials are refused. The wire protocol and existing clients are unchanged.
+- Single-process operation with persistent data. Device credentials survive restarts; Web users sign in again. Changing one account's password only revokes that account's device authorization.
 
 Tests: `pnpm --filter @dsh-remote/server test`. Cross-machine and long-running validation remain pending. UI sources: [web/UPSTREAM.md](web/UPSTREAM.md).
 
@@ -138,9 +161,9 @@ Tests: `pnpm --filter @dsh-remote/server test`. Cross-machine and long-running v
 
 Not for now. The product shape of Server Web is still being worked out and will continue to evolve with that direction. This repository only promises to maintain the small self-hosted version described above.
 
-### Why are multi-account support, full membership, and Remote Web not included?
+### Why are invite-code registration, organizations/RBAC, and Remote Web not included?
 
-These capabilities are not especially difficult to build, but users have different scenarios and trade-offs, so it is reasonable to adapt them to your own needs. Remote Web may be added to this Server after it becomes stable; there is no fixed schedule.
+Multiple accounts are supported, but accounts are provisioned by deployment configuration (`DSH_SERVER_ACCOUNTS` / `DSH_SERVER_ACCOUNTS_FILE`); there is no self-service registration, invite codes or admin console. These capabilities are not especially difficult to build, but users have different scenarios and trade-offs, so it is reasonable to adapt them to your own needs. Remote Web may be added to this Server after it becomes stable; there is no fixed schedule.
 
 ## Release Tag checks
 

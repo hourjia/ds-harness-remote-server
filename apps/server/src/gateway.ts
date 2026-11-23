@@ -394,7 +394,15 @@ export class Gateway {
       if (peer.role !== 'client') throw new ApiError('MEMBERSHIP_REQUIRED')
       const host = this.peers.get(request.hostDeviceId)
       if (!host || host.role !== 'host') { this.send(peer, createControlFrame('error', { code: 'HOST_OFFLINE', message: 'Host is offline.', retryable: true })); return }
-      this.store.get(host.id)
+      const clientDevice = this.store.get(peer.id)
+      const hostDevice = this.store.get(host.id)
+      // Ownership is the membership boundary. A Client from another account
+      // must not be able to probe, signal or relay against this Host, so the
+      // request is refused per connection instead of closing the Control link.
+      if (clientDevice.owner !== hostDevice.owner) {
+        this.send(peer, createControlFrame('error', { code: 'MEMBERSHIP_REQUIRED', message: 'Host belongs to another account.', retryable: false }))
+        return
+      }
       if (!request.preferredTransports.includes('relay') || !peer.capabilities.includes('transport.relay') || !host.capabilities.includes('transport.relay')) throw new ApiError('CAPABILITY_NOT_SUPPORTED')
       // The link coordinates only transports both peers actually advertised;
       // the Host receives the same intersection so it never sees a transport
@@ -418,7 +426,7 @@ export class Gateway {
       this.send(host, createControlFrame('connect.incoming', {
         connectionId: link.id,
         clientDeviceId: peer.id,
-        clientIdentityKey: this.store.get(peer.id).descriptor.identityKey,
+        clientIdentityKey: clientDevice.descriptor.identityKey,
         authorization: 'account',
         preferredTransports: link.preferredTransports,
       }))

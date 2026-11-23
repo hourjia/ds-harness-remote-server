@@ -6,6 +6,7 @@ import {
   parseHeartbeatDisconnect,
   parseForceTerminateGrace,
 } from './server.js'
+import { parseAccountList, parseAccountsFile, resolveAccountSeeds } from './accounts.js'
 import { parseLogLevel } from './logger.js'
 import { parseIceConfig } from './ice.js'
 
@@ -18,9 +19,19 @@ const helloTimeoutMs = parseHelloTimeout(process.env.DSH_SERVER_HELLO_TIMEOUT_MS
 const forceTerminateGraceMs = parseForceTerminateGrace(process.env.DSH_SERVER_FORCE_TERMINATE_GRACE_MS)
 const logLevel = parseLogLevel(process.env.DSH_SERVER_LOG_LEVEL)
 
+// Compose passes unset variables through as empty strings, so empty means absent.
+const accountsFile = process.env.DSH_SERVER_ACCOUNTS_FILE?.trim()
+const accounts = resolveAccountSeeds({
+  accounts: [
+    ...parseAccountList(process.env.DSH_SERVER_ACCOUNTS),
+    ...(accountsFile ? parseAccountsFile(accountsFile) : []),
+  ],
+  account: process.env.DSH_SERVER_ACCOUNT?.trim() || undefined,
+  password: process.env.DSH_SERVER_PASSWORD || undefined,
+})
+
 const app = createRemoteServer({
-  account: process.env.DSH_SERVER_ACCOUNT ?? '',
-  password: process.env.DSH_SERVER_PASSWORD ?? '',
+  accounts,
   publicUrl: process.env.DSH_SERVER_PUBLIC_URL ?? `http://localhost:${port}`,
   dataFile: resolve(process.env.DSH_SERVER_DATA_FILE ?? 'data/state.json'),
   trustedProxyIps: (process.env.DSH_SERVER_TRUSTED_PROXY_IPS ?? '').split(',').map(value => value.trim()).filter(Boolean),

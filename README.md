@@ -11,6 +11,7 @@ Client（手机 / 桌面 / Web）─┘
 ```
 
 - 负责账号授权、设备注册与凭据轮换、在线状态、连接协调
+- 支持多账号：同一账号下的 Host/Client 互相可见可连，不同账号之间设备、连接与 TURN 凭据完全隔离（账号通过环境变量预置）
 - 协调 WebRTC 的 `LAN → P2P → TURN → Relay` 四路选路
 - 无法直连时用 WebSocket 中继**密文**（Noise IK），不接触业务明文
 
@@ -36,12 +37,13 @@ Client（手机 / 桌面 / Web）─┘
 │   │   ├── main.ts       # 入口：读环境变量、监听端口
 │   │   ├── server.ts     # HTTP 路由、登录、设备注册、TURN 凭据
 │   │   ├── gateway.ts    # Control WebSocket、连接协调、WebRTC signaling、Relay
-│   │   ├── store.ts      # 设备凭据持久化（state.json）
+│   │   ├── store.ts      # 多账号与设备凭据持久化（state.json，含 v1 迁移）
+│   │   ├── accounts.ts   # 账号配置解析（env 列表 / JSON 文件 / 旧单账号）
 │   │   ├── ice.ts        # STUN/TURN 配置与短期凭据
 │   │   ├── config.ts     # 参数归一化与合法区间
 │   │   └── logger.ts     # 结构化日志
 │   ├── web/              # 自建版 Web 前端（React + antd）
-│   ├── tests/            # 52 个测试
+│   ├── tests/            # 58 个测试
 │   ├── Dockerfile
 │   └── compose.yaml
 ├── packages/
@@ -65,7 +67,7 @@ Client（手机 / 桌面 / Web）─┘
 ## 环境要求
 
 - **Node.js ≥ 22**（本仓库已用 `volta` 钉到 `24.22.2`，只要装过 Volta 即自动切换）
-  - 实测：Node 20.16 下 52 个测试有 1 个失败（`closes the production Client secure channel...`，卡在 `connect.incoming`）；切换到 Node 24.22.2 后 52/52 全通过。请勿用 Node 20 部署。
+  - 实测：Node 20.16 下旧版 52 个测试有 1 个失败（`closes the production Client secure channel...`，卡在 `connect.incoming`）；切换到 Node 24.22.2 后全通过。请勿用 Node 20 部署。
 - **pnpm 9.15.4**
 
 ## 快速开始
@@ -76,6 +78,7 @@ pnpm build
 
 cp apps/server/.env.example apps/server/.env
 # 编辑 .env：至少设置 DSH_SERVER_ACCOUNT 与 DSH_SERVER_PASSWORD（≥12 字符）
+# 多人使用改设 DSH_SERVER_ACCOUNTS（见下方配置说明）
 
 cd apps/server
 node --env-file=.env dist/main.js
@@ -114,8 +117,10 @@ docker compose up -d --build
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DSH_SERVER_ACCOUNT` | 必填 | 登录账号（建议邮箱格式） |
-| `DSH_SERVER_PASSWORD` | 必填 | 至少 12 字符 |
+| `DSH_SERVER_ACCOUNT` | 必填* | 单账号登录账号（建议邮箱格式）；与 `DSH_SERVER_ACCOUNTS` 互斥 |
+| `DSH_SERVER_PASSWORD` | 必填* | 单账号密码，至少 12 字符 |
+| `DSH_SERVER_ACCOUNTS` | 空 | 多账号列表 `account:password`，逗号或换行分隔；与上面的单账号变量互斥 |
+| `DSH_SERVER_ACCOUNTS_FILE` | 空 | 账号 JSON 文件路径 `[{"account","password"}]` |
 | `DSH_SERVER_PUBLIC_URL` | `http://localhost:8080` | 浏览器访问地址 |
 | `DSH_SERVER_HOST` | `127.0.0.1` | 监听地址；容器内用 `0.0.0.0` |
 | `DSH_SERVER_PORT` | `8080` | 监听端口 |
@@ -123,13 +128,15 @@ docker compose up -d --build
 | `DSH_SERVER_TRUSTED_PROXY_IPS` | 空 | 可信反代 IP，需覆盖 `X-Forwarded-For` |
 | `DSH_SERVER_STUN_URLS` / `TURN_URLS` | 空 | 留空则 Relay-only |
 
+\* `DSH_SERVER_ACCOUNT`/`DSH_SERVER_PASSWORD` 与 `DSH_SERVER_ACCOUNTS`/`DSH_SERVER_ACCOUNTS_FILE` 二选一：至少配置一组，且不能同时配置。账号从配置启动时同步；从配置中移除的账号会被禁用并吊销设备 token，设备记录保留。旧版单账号 `state.json` 会自动迁移。
+
 ## 测试
 
 ```bash
 pnpm test
 ```
 
-52 个测试，覆盖账号/设备授权、origin 校验、限流、网关握手状态机、连接协调、加密中继的篡改与重放拒绝等。
+58 个测试，覆盖账号/设备授权、多账号隔离与迁移、origin 校验、限流、网关握手状态机、连接协调、加密中继的篡改与重放拒绝等。
 
 ## 安全边界
 

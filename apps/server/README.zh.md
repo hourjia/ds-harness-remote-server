@@ -2,13 +2,34 @@
 
 [English](README.md) · **中文**
 
-单账号 Remote Server，支持 WebRTC（LAN / P2P / TURN）与端到端加密 Relay，环境变量配置账号密码，Web 提供首页、登录和设备状态页。Server 不包含在 Host 插件 bundle 中，需要单独部署。
+支持多账号的 Remote Server，支持 WebRTC（LAN / P2P / TURN）与端到端加密 Relay，通过环境变量预置账号密码，Web 提供首页、登录和设备状态页。同一账号下的 Host 与 Client 互相可见、可连接；不同账号之间完全隔离。Server 不包含在 Host 插件 bundle 中，需要单独部署。
 
 当前版本定位为继续维护的最小自部署 Server。完整 Server Web 的产品形态仍在调整，暂不承诺在本仓库开源当前或未来的完整站点。
 
 ## 自部署页面
 
-首页地址是 `/`，点击“开始使用”进入登录页；登录成功后进入 `/app/remote` 设备列表。Host 和客户端都填写同一个 Server 地址，并使用相同的账号密码登录。设备凭据由 Server 保存，Web 登录会话使用 HttpOnly Cookie。
+首页地址是 `/`，点击“开始使用”进入登录页；登录成功后进入 `/app/remote` 设备列表，只显示当前账号拥有的设备。Host 和客户端都填写同一个 Server 地址，且必须使用**同一账号**登录。
+
+## 多账号
+
+默认仍是单账号：设置 `DSH_SERVER_ACCOUNT` + `DSH_SERVER_PASSWORD` 即可，行为与之前一致。
+
+需要多人使用时，把账号改成列表（与旧的两个单账号变量**互斥**，不能同时设置）：
+
+```dotenv
+DSH_SERVER_ACCOUNTS=owner@example.com:first-long-password,teammate@example.com:second-long-password
+```
+
+- 用逗号或换行分隔，只按**第一个**冒号切分账号和密码，所以密码里可以有冒号，但不能有逗号或换行；密码含这些字符时改用 JSON 文件。
+- 复杂密码用 `DSH_SERVER_ACCOUNTS_FILE` 指向一个 JSON 数组：`[{"account":"a@example.com","password":"..."}]`。用 Docker 部署时需要自行把该文件挂载进容器。
+- 每个账号的密码至少 12 个字符；账号不能重复。
+- 隔离规则：Client 只能看到、连接、relay 同一账号下的 Host；跨账号的设备详情、改名、presence、`connect.request` 和 TURN 凭据都会被拒绝。
+- 修改某个账号的密码只会让该账号的设备凭据失效，其他账号不受影响。
+- 从配置里移除某个账号，会在下次启动时禁用该账号并吊销其设备 token；设备记录保留，重新加回账号即可恢复访问，无需重新注册。
+- 账号只在启动时从环境变量同步，运行中不会热更新；改配置后需要重启（容器部署用 `docker compose up -d --force-recreate server`）。
+- 旧的单账号 `state.json`（`version: 1`）会在首次启动时自动迁移，并留下 `state.json.v1.bak` 备份。
+
+Web 登录会话保存账号名，设备凭据保存设备归属；每账号默认最多 128 台设备。邀请码注册、组织/RBAC 和管理后台不在当前范围内。
 
 ## Docker 部署
 
@@ -69,7 +90,7 @@ pnpm --filter @dsh-remote/server build
 cp apps/server/.env.example apps/server/.env
 ```
 
-编辑 `apps/server/.env`，设置账号和至少 12 字符的密码，然后启动：
+编辑 `apps/server/.env`，设置账号和至少 12 字符的密码（或使用 `DSH_SERVER_ACCOUNTS` 配置多个账号），然后启动：
 
 ```bash
 cd apps/server
@@ -80,8 +101,10 @@ node --env-file=.env dist/main.js
 
 | 环境变量 | 用途 / 默认值 |
 | --- | --- |
-| `DSH_SERVER_ACCOUNT` | 必填，登录账号 |
-| `DSH_SERVER_PASSWORD` | 必填，至少 12 字符 |
+| `DSH_SERVER_ACCOUNT` | 单账号部署的登录账号；与 `DSH_SERVER_ACCOUNTS` 互斥 |
+| `DSH_SERVER_PASSWORD` | 单账号密码，至少 12 字符 |
+| `DSH_SERVER_ACCOUNTS` | 多账号列表 `account:password`，逗号或换行分隔；与上面的单账号变量互斥 |
+| `DSH_SERVER_ACCOUNTS_FILE` | 账号 JSON 文件路径 `[{"account","password"}]`；可与 `DSH_SERVER_ACCOUNTS` 叠加 |
 | `DSH_SERVER_PUBLIC_URL` | 浏览器访问地址，默认 `http://localhost:8080` |
 | `DSH_SERVER_HOST` | 监听/端口映射地址，默认 `127.0.0.1`；局域网设为 `0.0.0.0` |
 | `DSH_SERVER_PORT` | 默认 `8080` |
@@ -128,7 +151,8 @@ DSH_SERVER_TRUSTED_PROXY_IPS=172.18.0.2,2001:db8::2
 ## 功能
 
 - 支持设备注册、凭据刷新、设备发现、Control、WebRTC LAN/P2P/TURN 协调与端到端加密 Relay。
-- 单进程运行；持久化保存 `data` 目录。重启后设备凭据保留，Web 需重新登录；修改密码后设备需重新授权。
+- 支持多账号（环境变量预置）：账号之间设备隔离，跨账号的设备查询、改名、连接与 TURN 凭据全部拒绝；协议与客户端无需改动。
+- 单进程运行；持久化保存 `data` 目录。重启后设备凭据保留，Web 需重新登录；修改某个账号的密码只影响该账号的设备授权。
 
 验证：`pnpm --filter @dsh-remote/server test`。真实跨机与长期连接仍待回归。UI 复用来源见 [web/UPSTREAM.md](web/UPSTREAM.md)。
 
@@ -138,9 +162,9 @@ DSH_SERVER_TRUSTED_PROXY_IPS=172.18.0.2,2001:db8::2
 
 暂不考虑。Server Web 的产品形态我还在调整，后续会按实际思路继续演进；当前仓库只承诺维护上面介绍的最小自部署版本。
 
-### 为什么没有多账号、完整 membership 和 Remote Web？
+### 为什么还没有邀请码注册、组织/RBAC 和 Remote Web？
 
-这些能力本身实现门槛不高，但不同用户会有不同的场景和取舍，建议按自己的需求修改。Remote Web 稳定后，未来也可能加入当前 Server；目前没有固定时间表。
+多账号已支持，但账号仍需在部署配置中预置（`DSH_SERVER_ACCOUNTS` / `DSH_SERVER_ACCOUNTS_FILE`），没有自助注册、邀请码或管理后台。这些能力本身实现门槛不高，但不同用户会有不同的场景和取舍，建议按自己的需求修改。Remote Web 稳定后，未来也可能加入当前 Server；目前没有固定时间表。
 
 ## 发布 Tag 检查
 
