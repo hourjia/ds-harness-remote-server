@@ -116,7 +116,8 @@ async function connection(options: { hostCapabilities?: string[]; clientCapabili
   const host = await socket(h, options.hostCapabilities === undefined ? {} : { capabilities: options.hostCapabilities })
   const client = await socket(c, options.clientCapabilities === undefined ? {} : { capabilities: options.clientCapabilities })
   const ack = await host.next('hello.ack')
-  expect(ack).toMatchObject({ webrtcEnabled: true })
+  const hostCaps = options.hostCapabilities ?? fullCapabilities
+  expect(ack).toMatchObject({ webrtcEnabled: hostCaps.some(capability => capability !== 'transport.relay') })
   expect(ack.capabilities).toEqual(expect.arrayContaining(['transport.relay']))
   await client.next('hello.ack')
   client.send('connect.request', { hostDeviceId: h.deviceId, preferredTransports: options.preferredTransports ?? ['relay'] })
@@ -210,7 +211,7 @@ describe('account and device authorization', () => {
     expect((await request('/devices/register-owned-role', 'POST', { v: 1, device: descriptor }, h.accessToken)).status).toBe(409)
     expect((await request('/devices/register-owned-role', 'POST', { v: 1, device: descriptor }, c.accessToken)).status).toBe(200)
   })
-  it('persists credentials as digests, rotates refresh tokens and revokes a reused family', async () => {
+  it('persists credentials as digests and recovers a lost refresh response', async () => {
     const d = await device()
     const saved = readFileSync(join(dir, 'state.json'), 'utf8')
     expect(saved).not.toContain(d.refreshToken); expect(saved).not.toContain(d.accessToken); expect(saved).not.toContain(password)
@@ -219,8 +220,13 @@ describe('account and device authorization', () => {
     const rotated = await request('/auth/refresh', 'POST', { deviceId: d.deviceId, refreshToken: d.refreshToken })
     expect(rotated.status).toBe(200)
     expect(rotated.data.refreshTokenExpiresAt).toBe(d.refreshTokenExpiresAt)
-    expect((await request('/auth/refresh', 'POST', { deviceId: d.deviceId, refreshToken: d.refreshToken })).status).toBe(401)
-    expect((await request('/devices', 'GET', undefined, rotated.data.accessToken)).status).toBe(401)
+    // Replaying the consumed token returns the same successor instead of
+    // revoking the device: the response was simply lost on the wire.
+    const replay = await request('/auth/refresh', 'POST', { deviceId: d.deviceId, refreshToken: d.refreshToken })
+    expect(replay.status).toBe(200)
+    expect(replay.data.accessToken).toBe(rotated.data.accessToken)
+    expect(replay.data.refreshToken).toBe(rotated.data.refreshToken)
+    expect((await request('/devices', 'GET', undefined, rotated.data.accessToken)).status).toBe(200)
   })
   it('invalidates credentials when the configured password changes', async () => {
     const d = await device(); await app.close(); await start('a-different-password')
@@ -510,11 +516,16 @@ describe('webrtc signaling and TURN credentials', () => {
     expect(await partial.next('hello.ack')).toMatchObject({
       capabilities: ['transport.p2p', 'transport.relay'],
       webrtcEnabled: true,
-      webrtcFallbackTimeoutMs: 12_000,
+      // No TURN deployment: direct-only paths get the shorter fallback budget.
+      webrtcFallbackTimeoutMs: 3_000,
     })
+    const relayOnly = await socket(await device(), { capabilities: ['transport.relay'] })
+    expect(await relayOnly.next('hello.ack')).toMatchObject({ capabilities: ['transport.relay'], webrtcEnabled: false })
     const withoutTurn = await socket(await device(), { capabilities: fullCapabilities })
     expect(await withoutTurn.next('hello.ack')).toMatchObject({
       capabilities: ['transport.lan', 'transport.p2p', 'transport.relay'],
+      webrtcEnabled: true,
+      webrtcFallbackTimeoutMs: 3_000,
     })
     await app.close()
     await start(password, [], {
@@ -527,7 +538,11 @@ describe('webrtc signaling and TURN credentials', () => {
     })
     accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
     const withTurn = await socket(await device(), { capabilities: fullCapabilities })
-    expect(await withTurn.next('hello.ack')).toMatchObject({ capabilities: fullCapabilities })
+    expect(await withTurn.next('hello.ack')).toMatchObject({
+      capabilities: fullCapabilities,
+      webrtcEnabled: true,
+      webrtcFallbackTimeoutMs: 12_000,
+    })
   })
 
   it('forwards ordered WebRTC signaling and transport selection', async () => {
@@ -641,7 +656,11 @@ describe('webrtc signaling and TURN credentials', () => {
     expect((await request('/turn/credentials', 'GET', undefined, ctx.c.accessToken)).status).toBe(400)
 
     await handshake(ctx)
-    expect((await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, ctx.c.accessToken)).status).toBe(404)
+    // After the secure handshake the link is ready; TURN credentials stay
+    // available for an authenticated in-band transport upgrade, but only to
+    // the two live peers.
+    expect((await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, ctx.c.accessToken)).status).toBe(200)
+    expect((await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, ctx.h.accessToken)).status).toBe(200)
   })
 
   it('issues configured static TURN credentials', async () => {

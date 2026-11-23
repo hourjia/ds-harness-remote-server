@@ -39,6 +39,7 @@ export type RtcPeerConnectionDiagnosticEvent =
 
 export interface RtcPeerConnectionConfiguration {
   iceServers?: RtcIceServer[]
+  iceTransportPolicy?: 'all' | 'relay'
   onDiagnostic?: (event: RtcPeerConnectionDiagnosticEvent) => void
 }
 
@@ -106,12 +107,19 @@ export const RTC_DATA_CHANNEL_OPTIONS = { ordered: true } as const
  * package that references the DOM `RTCPeerConnection` global, so Node hosts
  * inject their own factory and never import browser natives.
  */
-export function browserRtcFactory(): RtcPeerConnectionFactory {
+/** Return false only if no send was attempted. Errors propagate without replaying data. */
+export type RtcBinarySender = (channel: unknown, data: ArrayBuffer) => boolean
+
+export function browserRtcFactory(options: { sendBinary?: RtcBinarySender } = {}): RtcPeerConnectionFactory {
+  const binarySender = options.sendBinary
   return {
     create(configuration) {
       // `any` keeps the DOM handler `this`/event typing out of the adapter.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const raw = new RTCPeerConnection({ iceServers: configuration.iceServers }) as any
+      const raw = new RTCPeerConnection({
+        iceServers: configuration.iceServers,
+        iceTransportPolicy: configuration.iceTransportPolicy,
+      }) as any
       return {
         get connectionState(): string { return raw.connectionState as string },
         get iceConnectionState(): string { return raw.iceConnectionState as string },
@@ -127,7 +135,7 @@ export function browserRtcFactory(): RtcPeerConnectionFactory {
         get onicecandidate() { return raw.onicecandidate as ((event: { candidate: RtcIceCandidateInit | null }) => void) | null },
         set ondatachannel(value) { raw.ondatachannel = value },
         get ondatachannel() { return raw.ondatachannel as ((event: { channel: RtcDataChannel }) => void) | null },
-        createDataChannel(label, options) { return adaptDataChannel(raw.createDataChannel(label, options)) },
+        createDataChannel(label, options) { return adaptDataChannel(raw.createDataChannel(label, options), binarySender) },
         createOffer() { return raw.createOffer() },
         createAnswer() { return raw.createAnswer() },
         setLocalDescription(description) { return raw.setLocalDescription(description) },
@@ -216,6 +224,21 @@ function summarizeIpv4Scope(parts: number[]): RtcAddressScope {
   return 'public'
 }
 
+export function isTailscaleInterface(
+  name: string,
+  addresses: readonly { address: string; internal: boolean }[],
+): boolean {
+  if (/^tailscale\d*$/i.test(name)) return true
+  // macOS Network Extensions use a generic utun name. Identify the interface
+  // by its Tailscale IPv6 address before offering its CGNAT IPv4 address.
+  return /^utun\d+$/i.test(name)
+    && addresses.some(({ address, internal }) => !internal && isTailscaleIpv6(address))
+}
+
+function isTailscaleIpv6(address: string): boolean {
+  return address.toLowerCase().startsWith('fd7a:115c:a1e0:')
+}
+
 function summarizeIpv6Scope(address: string): RtcAddressScope {
   const value = address.toLowerCase()
   if (value === '::1') return 'loopback'
@@ -223,13 +246,13 @@ function summarizeIpv6Scope(address: string): RtcAddressScope {
   // Tailscale assigns overlay addresses from fd7a:115c:a1e0::/48. They are
   // ULA-shaped, but a selected pair using them is not evidence of a physical
   // LAN path. Reuse the non-LAN cgnat scope used for Tailscale's IPv4 range.
-  if (value.startsWith('fd7a:115c:a1e0:')) return 'cgnat'
+  if (isTailscaleIpv6(value)) return 'cgnat'
   if (value.startsWith('fc') || value.startsWith('fd')) return 'private'
   if (value.startsWith('ff')) return 'reserved'
   return 'public'
 }
 
-function adaptDataChannel(raw: RTCDataChannel): RtcDataChannel {
+function adaptDataChannel(raw: RTCDataChannel, sendBinary?: RtcBinarySender): RtcDataChannel {
   return {
     get label(): string { return raw.label },
     get ordered(): boolean { return raw.ordered },
@@ -247,7 +270,10 @@ function adaptDataChannel(raw: RTCDataChannel): RtcDataChannel {
     get onerror() { return raw.onerror as (() => void) | null },
     set onbufferedamountlow(value) { raw.onbufferedamountlow = value },
     get onbufferedamountlow() { return raw.onbufferedamountlow as (() => void) | null },
-    send(data) { raw.send(data as never) },
+    send(data) {
+      if (data instanceof ArrayBuffer && sendBinary?.(raw, data)) return
+      raw.send(data as never)
+    },
     close() { raw.close() },
   }
 }

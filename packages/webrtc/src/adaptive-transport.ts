@@ -1,7 +1,10 @@
 import { ControlLease } from './control-lease.js'
 import { waitForRelayCapacity } from './websocket-backpressure.js'
 import {
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
   PROTOCOL_VERSION,
+  errorCodeSchema,
+  type ErrorCode,
   WEBRTC_RESUME_CAPABILITY,
   RELAY_RESUME_CAPABILITY,
   type ConnectionLeaseAck,
@@ -46,9 +49,16 @@ export interface AdaptiveTransportOptions {
   targetDeviceId: string
   capabilities?: string[]
   preferredTransports?: Array<'lan' | 'p2p' | 'turn' | 'relay'>
+  failOnWebRtcFallback?: boolean
+  onParallelConnections?: () => void
+  onWebRtcStarted?: (timeoutMs: number) => void
   forceRelay?: boolean
+  /** Select Relay for initial setup only on routes that do not request LAN; LAN always negotiates WebRTC first. */
+  relayFirst?: boolean
   /** Control authorization only, ending at connect.accepted. */
   handshakeTimeoutMs?: number
+  /** Opt in to the configured Server budget; other clients retain their local ceiling. */
+  useServerNegotiateTimeout?: boolean
   negotiateTimeoutMs?: number
   iceServersTimeoutMs?: number
   signal?: AbortSignal
@@ -63,6 +73,7 @@ export interface AdaptiveTransportOptions {
 export interface AdaptiveDisconnectDiagnostic {
   reason: 'control-closed' | 'control-error' | 'invalid-control-frame' | 'webrtc-closed'
   closeCode?: number
+  errorCode?: ErrorCode
   closeReason?: string
   /** Selected data-plane transport of an established WebRTC path that closed. */
   transport?: 'lan' | 'p2p' | 'turn'
@@ -80,6 +91,7 @@ export interface AdaptiveConnectionDetails {
   preferredTransports: Array<'lan' | 'p2p' | 'turn' | 'relay'>
   negotiatedCapabilities: string[]
   webRtcEnabled: boolean
+  relay?: { path: 'control' } | { path: 'node'; host?: string; id?: string }
   webRtc?: RtcConnectionDetails
 }
 
@@ -98,6 +110,7 @@ const DEFAULT_PREFERRED_TRANSPORTS = ['lan', 'p2p', 'turn', 'relay'] as const
  */
 export class AdaptiveTransport extends BaseTransport {
   private readonly handshakeHandlers = new Set<(step: number, data: Uint8Array) => void>()
+  private readonly sequencedHandlers = new Set<(counter: number | undefined, data: Uint8Array) => void>()
   private socket?: WebSocket
   private dataSocket?: WebSocket
   private connectionId?: string
@@ -123,6 +136,8 @@ export class AdaptiveTransport extends BaseTransport {
   private lastRtcDiagnostics?: RtcConnectionDiagnostics
   private relayAssignment?: RelayAssignment
   private dataReady = false
+  private dataSocketTimer?: ReturnType<typeof setTimeout>
+  private isUpgradedLegActive?: () => boolean
   private recoveryTicket?: string
   private relayRecoveryTicket?: string
   private lease?: ControlLease
@@ -146,6 +161,7 @@ export class AdaptiveTransport extends BaseTransport {
     this.webrtcEnabled = true
     this.serverNegotiateTimeoutMs = undefined
     this.dataMode = 'relay'
+    this.isUpgradedLegActive = undefined
     this.selected = undefined
     this.connectedAt = undefined
     this.relayCounter = 0
@@ -159,7 +175,7 @@ export class AdaptiveTransport extends BaseTransport {
       this.options.signal?.addEventListener('abort', onAbort, { once: true })
       this.removeAbort = () => this.options.signal?.removeEventListener('abort', onAbort)
       this.handshakeTimer = setTimeout(
-        () => this.failConnection(new Error('Adaptive control handshake timed out')),
+        () => this.failConnection(Object.assign(new Error('Adaptive control handshake timed out'), { code: 'TRANSPORT_SETUP_FAILED' })),
         this.options.handshakeTimeoutMs ?? 15_000,
       )
       const socket = this.socket!
@@ -175,7 +191,7 @@ export class AdaptiveTransport extends BaseTransport {
         })
       }
       socket.onerror = () => {
-        if (this.lifetime === lifetime && this.socket === socket) this.controlLost(new Error('Control socket failed'), { reason: 'control-error' })
+        if (this.lifetime === lifetime && this.socket === socket) this.controlLost(Object.assign(new Error('Control socket failed'), { code: 'TRANSPORT_SETUP_FAILED' }), { reason: 'control-error' })
       }
       socket.onclose = event => {
         if (this.lifetime === lifetime && this.socket === socket) this.controlLost(adaptiveControlCloseError(event), { reason: 'control-closed', closeCode: event.code, closeReason: event.reason })
@@ -221,6 +237,17 @@ export class AdaptiveTransport extends BaseTransport {
 
   async connectionDetails(): Promise<AdaptiveConnectionDetails> {
     const remainingMs = this.lease?.remainingMs()
+    const assignment = this.relayAssignment
+    let relay: AdaptiveConnectionDetails['relay']
+    if (this.selected === 'relay') {
+      if (assignment?.relayEndpoint === undefined) {
+        if (this.socket?.readyState === WebSocket.OPEN) relay = { path: 'control' }
+      } else if (this.dataReady && this.dataSocket?.readyState === WebSocket.OPEN) {
+        // React Native's URL.host does not support WebSocket URLs.
+        const host = assignment.relayEndpoint.match(/^wss?:\/\/(?:[^/?#]*@)?([^@/?#]+)/i)?.[1]
+        relay = { path: 'node', host, id: assignment.relayNodeId }
+      }
+    }
     return {
       ...(this.connectionId === undefined ? {} : { connectionId: this.connectionId }),
       ...(this.connectedAt === undefined ? {} : { connectedAt: this.connectedAt }),
@@ -235,6 +262,7 @@ export class AdaptiveTransport extends BaseTransport {
         : [...(this.options.preferredTransports ?? DEFAULT_PREFERRED_TRANSPORTS)],
       negotiatedCapabilities: [...this.negotiatedCapabilities],
       webRtcEnabled: this.webrtcEnabled,
+      ...(relay === undefined ? {} : { relay }),
       ...(this.rtc === undefined ? {} : { webRtc: await this.rtc.connectionDetails() }),
     }
   }
@@ -254,6 +282,11 @@ export class AdaptiveTransport extends BaseTransport {
   onHandshake(cb: (step: number, data: Uint8Array) => void): () => void {
     this.handshakeHandlers.add(cb)
     return () => this.handshakeHandlers.delete(cb)
+  }
+
+  onSequencedMessage(cb: (counter: number | undefined, data: Uint8Array) => void): () => void {
+    this.sequencedHandlers.add(cb)
+    return () => this.sequencedHandlers.delete(cb)
   }
 
   async close(): Promise<void> {
@@ -321,6 +354,10 @@ export class AdaptiveTransport extends BaseTransport {
           throw new Error('connect.accepted did not include a connectionId')
         }
         this.connectionId = payload.connectionId
+        if (this.options.useServerNegotiateTimeout && typeof payload.webrtcFallbackTimeoutMs === 'number') {
+          this.serverNegotiateTimeoutMs = payload.webrtcFallbackTimeoutMs
+        }
+        if (payload.parallelConnections === true) this.options.onParallelConnections?.()
         if (this.negotiatedCapabilities.includes(WEBRTC_RESUME_CAPABILITY)) this.recoveryTicket = payload.recoveryTicket
         if (this.negotiatedCapabilities.includes(RELAY_RESUME_CAPABILITY)) this.relayRecoveryTicket = payload.relayRecoveryTicket
         const assignment = payload as RelayAssignment
@@ -341,7 +378,13 @@ export class AdaptiveTransport extends BaseTransport {
       if (frame.type === 'connect.rejected' || frame.type === 'error') {
         const payload = frame.payload as { message?: unknown; code?: unknown; retryable?: unknown }
         const message = typeof payload.message === 'string' ? payload.message : 'Server rejected the connection'
-        throw Object.assign(new Error(message), { code: payload.code, retryable: payload.retryable })
+        const failure = Object.assign(new Error(message), { code: payload.code, retryable: payload.retryable })
+        const code = errorCodeSchema.safeParse(payload.code)
+        this.failConnection(failure, {
+          reason: payload.retryable === true ? 'control-error' : 'invalid-control-frame',
+          ...(code.success ? { errorCode: code.data } : {}),
+        })
+        return
       }
       if (frame.type === 'relay') {
         if (this.dataSocket !== undefined) return
@@ -380,7 +423,8 @@ export class AdaptiveTransport extends BaseTransport {
     } catch (error) {
       const failure = error instanceof Error ? error : new Error('Invalid adaptive control frame')
       if (!('code' in failure)) Object.assign(failure, { code: 'INVALID_MESSAGE' })
-      this.failConnection(failure, { reason: 'invalid-control-frame' })
+      const code = errorCodeSchema.safeParse((failure as Error & { code?: unknown }).code)
+      this.failConnection(failure, { reason: 'invalid-control-frame', ...(code.success ? { errorCode: code.data } : {}) })
     }
   }
 
@@ -393,13 +437,17 @@ export class AdaptiveTransport extends BaseTransport {
     }
     const data = fromBase64Url(payload.ciphertext)
     this.bytesReceived += data.byteLength
+    for (const handler of this.sequencedHandlers) handler(payload.counter as number, data)
     this.emit(data)
   }
 
   private async negotiate(signal: AbortSignal): Promise<void> {
     if (this.connectionId === undefined) return
     const preferred = this.negotiatedTransports()
-    const wantWebRtc = !this.options.forceRelay && this.webrtcEnabled
+    // Older Servers expose LAN candidates through transport.p2p. Preserve the
+    // caller's LAN intent even when transport.lan is absent from hello.ack.
+    const lanRequested = (this.options.preferredTransports ?? DEFAULT_PREFERRED_TRANSPORTS).includes('lan')
+    const wantWebRtc = !this.options.forceRelay && (!this.options.relayFirst || lanRequested) && this.webrtcEnabled
       && (preferred.includes('lan') || preferred.includes('p2p') || preferred.includes('turn'))
     let selected: SelectedTransport = 'relay'
     this.lastRtcDiagnostics = undefined
@@ -421,6 +469,7 @@ export class AdaptiveTransport extends BaseTransport {
           selected = 'relay'
         } else {
           this.dataMode = 'webrtc'
+          this.retireDataSocket(this.dataSocket)
           selected = wireSelected
         }
       } catch (error) {
@@ -430,6 +479,7 @@ export class AdaptiveTransport extends BaseTransport {
         await this.rtc?.close()
         throwIfAborted(signal)
         this.rtc = undefined
+        if (this.options.failOnWebRtcFallback) throw Object.assign(new Error('WebRTC attempt failed'), { code: 'RTC_NEGOTIATION_FAILED', cause: reason })
         if (!preferred.includes('relay')) throw reason
         this.dataMode = 'relay'
         selected = 'relay'
@@ -480,16 +530,25 @@ export class AdaptiveTransport extends BaseTransport {
       iceServers = []
     }
     throwIfAborted(signal)
-    const negotiatedMs = negotiateTimeout(this.serverNegotiateTimeoutMs, this.options.negotiateTimeoutMs)
+    const negotiatedMs = this.options.useServerNegotiateTimeout
+      ? Math.min(2_147_483_647, this.serverNegotiateTimeoutMs ?? this.options.negotiateTimeoutMs ?? 8_000)
+      : negotiateTimeout(this.serverNegotiateTimeoutMs, this.options.negotiateTimeoutMs)
     // Without STUN/TURN servers only same-LAN host candidates can succeed;
     // fail fast instead of waiting the full timeout on cross-network links.
     const effectiveNegotiateTimeoutMs = iceServers.length === 0
       ? Math.min(negotiatedMs ?? DEFAULT_EMPTY_ICE_NEGOTIATE_TIMEOUT_MS, DEFAULT_EMPTY_ICE_NEGOTIATE_TIMEOUT_MS)
       : negotiatedMs
+    this.options.onWebRtcStarted?.(effectiveNegotiateTimeoutMs ?? 8_000)
     const rtc = new RtcDataChannelTransport({
       role: 'initiator',
       factory,
       iceServers,
+      // A TURN-only attempt must constrain ICE itself. Otherwise a faster
+      // direct pair wins, then gets rejected as an unnegotiated transport.
+      iceTransportPolicy: this.negotiatedTransports().includes('turn')
+        && !this.negotiatedTransports().some(transport => transport === 'lan' || transport === 'p2p')
+        ? 'relay'
+        : 'all',
       onSignal: signal => this.sendRtcSignal(signal),
       negotiateTimeoutMs: effectiveNegotiateTimeoutMs,
       label: `client->${this.options.targetDeviceId}`,
@@ -502,6 +561,7 @@ export class AdaptiveTransport extends BaseTransport {
     rtc.onMessage(data => {
       if (this.lease && !this.lease.valid()) return
       this.bytesReceived += data.byteLength
+      for (const handler of this.sequencedHandlers) handler(undefined, data)
       this.emit(data)
     })
     rtc.onClose(() => {
@@ -535,7 +595,16 @@ export class AdaptiveTransport extends BaseTransport {
     const ticket = this.dataMode === 'webrtc' ? this.recoveryTicket : this.dataReady && this.dataSocket?.readyState === WebSocket.OPEN ? this.relayRecoveryTicket : undefined
     if (!ticket || !this.connectionId || this.lease) return
     this.lease = new ControlLease(this.connectionId, ticket, payload => {
-      if (this.controlReady && this.lastControlReceivedAt !== undefined && Date.now() - this.lastControlReceivedAt >= 75_000) {
+      if (!this.controlReady) {
+        throw Object.assign(new Error('Adaptive control channel is not authenticated'), { code: 'TRANSPORT_CLOSED' })
+      }
+      const intervalMs = typeof this.heartbeatIntervalMs === 'number'
+        && Number.isFinite(this.heartbeatIntervalMs)
+        && this.heartbeatIntervalMs > 0
+        ? this.heartbeatIntervalMs
+        : DEFAULT_HEARTBEAT_INTERVAL_MS
+      const heartbeatTimeoutMs = Math.max(15_000, intervalMs * 3)
+      if (this.lastControlReceivedAt !== undefined && Date.now() - this.lastControlReceivedAt >= heartbeatTimeoutMs) {
         this.controlLost(new Error('Control heartbeat timed out'), { reason: 'control-error' })
         throw new Error('Control heartbeat timed out')
       }
@@ -544,9 +613,21 @@ export class AdaptiveTransport extends BaseTransport {
     this.lease.start()
   }
 
+  /**
+   * Retire the independent Relay data socket once an in-band upgrade has moved
+   * traffic onto WebRTC, so an idle close on the old Relay leg cannot tear down
+   * the healthy upgraded connection.
+   */
+  retireRelayDataSocket(isUpgradedLegActive?: () => boolean): void {
+    this.isUpgradedLegActive = isUpgradedLegActive
+    this.retireDataSocket(this.dataSocket)
+  }
+
   private controlLost(error: Error, diagnostic: AdaptiveDisconnectDiagnostic): void {
-    if ((error as Error & { retryable?: boolean }).retryable === false || !this.lease?.canDetach()
-      || !(this.dataMode === 'webrtc' ? this.rtc?.getStats().connected : this.dataReady && this.dataSocket?.readyState === WebSocket.OPEN)) {
+    const dataPlaneAlive = this.dataMode === 'webrtc'
+      ? this.rtc?.getStats().connected === true
+      : (this.dataReady && this.dataSocket?.readyState === WebSocket.OPEN) || this.isUpgradedLegActive?.() === true
+    if ((error as Error & { retryable?: boolean }).retryable === false || !this.lease?.canDetach() || !dataPlaneAlive) {
       this.failConnection(error, diagnostic)
       return
     }
@@ -661,17 +742,28 @@ export class AdaptiveTransport extends BaseTransport {
     socket.binaryType = 'arraybuffer'
     this.dataSocket = socket
     await new Promise<void>((resolve, reject) => {
+      const clearTimer = (): void => {
+        if (this.dataSocketTimer !== undefined) clearTimeout(this.dataSocketTimer)
+        this.dataSocketTimer = undefined
+      }
       const timer = setTimeout(() => {
+        if (this.dataSocket !== socket) return
+        clearTimer()
+        this.retireDataSocket(socket)
         reject(new Error('Relay data attach timed out'))
-        socket.close()
       }, this.options.handshakeTimeoutMs ?? 15_000)
-      socket.onopen = () => socket.send(encodeRelayDataFrame(createRelayDataFrame('relay.attach', {
-        connectionId: this.connectionId,
-        deviceId: this.options.deviceId,
-        peerDeviceId: this.options.targetDeviceId,
-        ticket: assignment.relayTicket,
-      }), this.controlFrameLimits))
+      this.dataSocketTimer = timer
+      socket.onopen = () => {
+        if (this.dataSocket !== socket) return
+        socket.send(encodeRelayDataFrame(createRelayDataFrame('relay.attach', {
+          connectionId: this.connectionId,
+          deviceId: this.options.deviceId,
+          peerDeviceId: this.options.targetDeviceId,
+          ticket: assignment.relayTicket,
+        }), this.controlFrameLimits))
+      }
       socket.onmessage = event => {
+        if (this.dataSocket !== socket) return
         try {
           if (typeof event.data !== 'string') throw new Error('Relay data frames must be text JSON')
           const data = decodeRelayDataFrame(event.data, this.controlFrameLimits)
@@ -680,40 +772,71 @@ export class AdaptiveTransport extends BaseTransport {
               || (assignment.relayEpoch !== undefined && data.payload.epoch !== assignment.relayEpoch)) {
               throw new Error('Relay data attach assignment mismatch')
             }
-            clearTimeout(timer)
+            clearTimer()
             this.dataReady = true
             resolve()
             return
           }
-          void this.handleDataSocketFrame(data.type, data.payload).catch(error => {
-            this.failConnection(error instanceof Error ? error : new Error('Invalid Relay data frame'))
+          void this.handleDataSocketFrame(socket, data.type, data.payload).catch(error => {
+            if (this.dataSocket === socket && this.dataMode === 'relay') {
+              this.failConnection(error instanceof Error ? error : new Error('Invalid Relay data frame'))
+            }
           })
         } catch (error) {
-          clearTimeout(timer)
+          clearTimer()
           reject(error instanceof Error ? error : new Error('Invalid Relay data frame'))
-          this.failConnection(error instanceof Error ? error : new Error('Invalid Relay data frame'))
+          if (this.dataSocket === socket && this.dataMode === 'relay') {
+            this.failConnection(error instanceof Error ? error : new Error('Invalid Relay data frame'))
+          }
         }
       }
       socket.onerror = () => {
-        clearTimeout(timer)
+        if (this.dataSocket !== socket) return
+        clearTimer()
         reject(new Error('Relay data socket failed'))
       }
       socket.onclose = () => {
-        clearTimeout(timer)
-        if (!this.dataReady) reject(new Error('Relay data socket closed before attach'))
-        else this.failConnection(new Error('Relay data socket closed'))
+        if (this.dataSocket !== socket) return
+        clearTimer()
+        if (!this.dataReady) {
+          this.dataSocket = undefined
+          reject(new Error('Relay data socket closed before attach'))
+        } else if (this.dataMode === 'relay') {
+          this.failConnection(new Error('Relay data socket closed'))
+        } else {
+          this.retireDataSocket(socket)
+        }
       }
     })
   }
 
-  private async handleDataSocketFrame(type: string, payload: Record<string, unknown>): Promise<void> {
+  private retireDataSocket(socket: WebSocket | undefined): void {
+    if (socket === undefined) return
+    if (this.dataSocket === socket) {
+      this.dataSocket = undefined
+      this.dataReady = false
+      if (this.dataSocketTimer !== undefined) {
+        clearTimeout(this.dataSocketTimer)
+        this.dataSocketTimer = undefined
+      }
+    }
+    socket.onopen = null
+    socket.onmessage = null
+    socket.onerror = socket.readyState === 0 ? () => undefined : null
+    socket.onclose = null
+    try { socket.close() } catch { /* already closed */ }
+  }
+
+  private async handleDataSocketFrame(socket: WebSocket, type: string, payload: Record<string, unknown>): Promise<void> {
+    if (this.dataSocket !== socket) return
     if (type === 'relay.detach') {
-      this.failConnection(new Error('Relay peer detached'))
+      if (this.dataMode === 'relay') this.failConnection(new Error('Relay peer detached'))
+      else this.retireDataSocket(socket)
       return
     }
     if (type === 'ping') {
-      if (this.dataSocket?.readyState === WebSocket.OPEN) {
-        this.dataSocket.send(encodeRelayDataFrame(createRelayDataFrame('pong', payload), this.controlFrameLimits))
+      if (this.dataSocket === socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(encodeRelayDataFrame(createRelayDataFrame('pong', payload), this.controlFrameLimits))
       }
       return
     }
@@ -724,6 +847,7 @@ export class AdaptiveTransport extends BaseTransport {
       }
       const data = fromBase64Url(payload.ciphertext)
       this.bytesReceived += data.byteLength
+      for (const handler of this.sequencedHandlers) handler(payload.counter as number, data)
       this.emit(data)
       return
     }
@@ -786,13 +910,18 @@ export class AdaptiveTransport extends BaseTransport {
     this.socket = undefined
     this.dataSocket = undefined
     this.dataReady = false
+    this.isUpgradedLegActive = undefined
+    if (this.dataSocketTimer !== undefined) {
+      clearTimeout(this.dataSocketTimer)
+      this.dataSocketTimer = undefined
+    }
     this.relayAssignment = undefined
     this.connectionId = undefined
     this.connectedAt = undefined
     lifetime?.abort()
     reject?.(error)
     void rtc?.close()
-    dataSocket?.close()
+    this.retireDataSocket(dataSocket)
     socket?.close()
     if (established && diagnostic !== undefined) {
       try { this.options.onDisconnect?.(diagnostic) } catch { /* diagnostics must not prevent close */ }
@@ -872,7 +1001,7 @@ function negotiateTimeout(serverMs: number | undefined, localMs: number | undefi
 }
 
 const DEFAULT_EMPTY_ICE_NEGOTIATE_TIMEOUT_MS = 4_000
-const SERVER_NEGOTIATE_TIMEOUT_MIN_MS = 6_000
+const SERVER_NEGOTIATE_TIMEOUT_MIN_MS = 2_000
 const SERVER_NEGOTIATE_TIMEOUT_MAX_MS = 12_000
 
 // React Native AbortSignal implementations may omit throwIfAborted().

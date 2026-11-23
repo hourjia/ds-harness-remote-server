@@ -21,7 +21,7 @@ Client（手机 / 桌面 / Web）─┘
 |---|---|
 | 上游 | `https://github.com/liguobao/ds-harness-remote` |
 | 本仓库 | 上游 `apps/server` + `packages/protocol` + 测试所需的 `crypto` / `webrtc` |
-| 版本基线 | 上游 `v0.6.3`（server 包版本 `0.5.21`） |
+| 版本基线 | 上游 `v0.6.7`（server 包版本 `0.5.21`，同步到 `d026990`） |
 | 协议 | DSH Remote Protocol v1，见上游 `docs/protocol.md` |
 | 许可 | MIT，版权归 `DSH Remote contributors`，见 [LICENSE](./LICENSE) |
 
@@ -43,7 +43,7 @@ Client（手机 / 桌面 / Web）─┘
 │   │   ├── config.ts     # 参数归一化与合法区间
 │   │   └── logger.ts     # 结构化日志
 │   ├── web/              # 自建版 Web 前端（React + antd）
-│   ├── tests/            # 58 个测试
+│   ├── tests/            # 63 个测试
 │   ├── Dockerfile
 │   └── compose.yaml
 ├── packages/
@@ -126,6 +126,7 @@ docker compose up -d --build
 | `DSH_SERVER_PORT` | `8080` | 监听端口 |
 | `DSH_SERVER_DATA_FILE` | `data/state.json` | 凭据持久化文件 |
 | `DSH_SERVER_TRUSTED_PROXY_IPS` | 空 | 可信反代 IP，需覆盖 `X-Forwarded-For` |
+| `DSH_SERVER_MAX_FRAMES_PER_SEC` | `512` | 单连接控制帧限流（64–65536）；已关闭链路的迟到帧走独立预算静默丢弃 |
 | `DSH_SERVER_STUN_URLS` / `TURN_URLS` | 空 | 留空则 Relay-only |
 
 \* `DSH_SERVER_ACCOUNT`/`DSH_SERVER_PASSWORD` 与 `DSH_SERVER_ACCOUNTS`/`DSH_SERVER_ACCOUNTS_FILE` 二选一：至少配置一组，且不能同时配置。账号从配置启动时同步；从配置中移除的账号会被禁用并吊销设备 token，设备记录保留。旧版单账号 `state.json` 会自动迁移。
@@ -136,7 +137,7 @@ docker compose up -d --build
 pnpm test
 ```
 
-58 个测试，覆盖账号/设备授权、多账号隔离与迁移、origin 校验、限流、网关握手状态机、连接协调、加密中继的篡改与重放拒绝等。
+63 个测试，覆盖账号/设备授权、多账号隔离与迁移、origin 校验、限流、网关握手状态机、连接协调、凭据刷新恢复、加密中继的篡改与重放拒绝等。
 
 ## 安全边界
 
@@ -144,6 +145,7 @@ pnpm test
 - 账号 membership 与 Host 本地固定的设备 identity **必须同时**通过
 - 公网部署必须走 HTTPS 反代，且 Server 端口不可直接暴露
 - 密码以 scrypt 派生后存储；设备凭据持久化在 `state.json`
+- refresh 响应丢失时旧 token 可幂等换回同一后继 pair（不延长有效期、不撤销设备凭据）；恢复元数据只含摘要、nonce 与过期时间
 
 ## 修改约定
 

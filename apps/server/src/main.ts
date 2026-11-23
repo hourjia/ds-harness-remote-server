@@ -5,6 +5,7 @@ import {
   parseHeartbeatInterval,
   parseHeartbeatDisconnect,
   parseForceTerminateGrace,
+  parseMaxFramesPerSec,
 } from './server.js'
 import { parseAccountList, parseAccountsFile, resolveAccountSeeds } from './accounts.js'
 import { parseLogLevel } from './logger.js'
@@ -17,6 +18,7 @@ const heartbeatIntervalMs = parseHeartbeatInterval(process.env.DSH_SERVER_HEARTB
 const heartbeatDisconnectMs = parseHeartbeatDisconnect(process.env.DSH_SERVER_HEARTBEAT_DISCONNECT_MS, heartbeatIntervalMs)
 const helloTimeoutMs = parseHelloTimeout(process.env.DSH_SERVER_HELLO_TIMEOUT_MS)
 const forceTerminateGraceMs = parseForceTerminateGrace(process.env.DSH_SERVER_FORCE_TERMINATE_GRACE_MS)
+const maxFramesPerSec = parseMaxFramesPerSec(process.env.DSH_SERVER_MAX_FRAMES_PER_SEC)
 const logLevel = parseLogLevel(process.env.DSH_SERVER_LOG_LEVEL)
 
 // Compose passes unset variables through as empty strings, so empty means absent.
@@ -39,6 +41,7 @@ const app = createRemoteServer({
   heartbeatIntervalMs,
   heartbeatDisconnectMs,
   forceTerminateGraceMs,
+  maxFramesPerSec,
   logLevel,
   ice: parseIceConfig(process.env),
 })
