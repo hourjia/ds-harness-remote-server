@@ -47,6 +47,10 @@ services:
       # Holds state.json: account verifier plus device credentials. Never
       # recreate this volume casually (`down -v` wipes every registered device).
       - server-data:/data
+      # Optional: a JSON account list. The container runs as uid 1000 (`node`),
+      # so make the file readable by that user (chown 1000:1000; chmod 400),
+      # then set DSH_SERVER_ACCOUNTS_FILE to the container path.
+      # - ./dsh-accounts.json:/run/secrets/dsh-accounts.json:ro
     restart: unless-stopped
     init: true
 

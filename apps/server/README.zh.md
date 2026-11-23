@@ -25,7 +25,7 @@ DSH_SERVER_ACCOUNTS=owner@example.com:first-long-password,teammate@example.com:s
 - 每个账号的密码至少 12 个字符；账号不能重复。
 - 隔离规则：Client 只能看到、连接、relay 同一账号下的 Host；跨账号的设备详情、改名、presence、`connect.request` 和 TURN 凭据都会被拒绝。
 - 修改某个账号的密码只会让该账号的设备凭据失效，其他账号不受影响。
-- 从配置里移除某个账号，会在下次启动时禁用该账号并吊销其设备 token；设备记录保留，重新加回账号即可恢复访问，无需重新注册。
+- 从配置里移除某个账号，会在下次启动时禁用该账号并吊销其设备 token；设备记录与本机身份保留，重新加回账号后受影响的设备用该账号重新登录、以同一 deviceId 重新注册即可恢复，不需要生成新的设备身份。
 - 账号只在启动时从环境变量同步，运行中不会热更新；改配置后需要重启（容器部署用 `docker compose up -d --force-recreate server`）。
 - 旧的单账号 `state.json`（`version: 1`）会在首次启动时自动迁移，并留下 `state.json.v1.bak` 备份。
 

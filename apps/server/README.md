@@ -25,7 +25,7 @@ DSH_SERVER_ACCOUNTS=owner@example.com:first-long-password,teammate@example.com:s
 - Each password must be at least 12 characters; accounts must be unique.
 - Isolation: a Client can only list, inspect, rename, connect to and relay through Hosts owned by its own account. Cross-account device details, presence, renames, `connect.request` and TURN credentials are refused.
 - Changing one account's password revokes only that account's device credentials.
-- Removing an account from the configuration disables it on the next start and revokes its device tokens; device records are kept, so re-adding the account restores access without re-registration.
+- Removing an account from the configuration disables it on the next start and revokes its device tokens. Device records and local identities are kept: after re-adding the account, affected devices sign in again and re-register the same deviceId for fresh tokens — no new device identity is needed.
 - Accounts are synced from the environment at startup only; restart after changing them (`docker compose up -d --force-recreate server` for containers).
 - A v1 single-account `state.json` is migrated automatically on first start, with a `state.json.v1.bak` backup.
 - Each account is capped at 128 devices by default. Invite-code registration, organizations/RBAC and an admin console are not included.

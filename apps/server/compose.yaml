@@ -29,6 +29,10 @@ services:
       DSH_SERVER_TURN_TTL_SECONDS: ${DSH_SERVER_TURN_TTL_SECONDS:-300}
     volumes:
       - server-data:/data
+      # Optional: a JSON account list. The container runs as uid 1000 (`node`),
+      # so make the file readable by that user (chown 1000:1000; chmod 400),
+      # then set DSH_SERVER_ACCOUNTS_FILE to the container path.
+      # - ./dsh-accounts.json:/run/secrets/dsh-accounts.json:ro
     restart: unless-stopped
     init: true
 
