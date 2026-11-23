@@ -10,6 +10,12 @@ This remains a small self-hosted Server that we intend to maintain. The product 
 
 The `/` landing page links to `/app/login`; a successful sign-in continues to `/app/remote`, which lists only the devices owned by the signed-in account. Point both Host and Client at the same Server URL and sign in with the **same account**. Device credentials are persisted by the Server, while Web sessions use an HttpOnly cookie.
 
+## Refresh response recovery
+
+If a refresh succeeds but its response is lost, retrying the previous refresh token returns the same successor pair, including after a Server restart. Recovery remains available until that successor is rotated again, revoked, or expired; it does not extend either token's lifetime. An expired recovered access token can be replaced by rotating the recovered refresh token. Older tokens are rejected without revoking current credentials.
+
+Tokens already consumed before this upgrade have no recovery metadata and cannot be recovered; revoked or expired credentials still require sign-in. Recovery metadata contains no plaintext bearer tokens; see [the refresh protocol](../../docs/protocol.md).
+
 ## Multiple accounts
 
 The default stays single-account: set `DSH_SERVER_ACCOUNT` + `DSH_SERVER_PASSWORD` and behavior is unchanged.
@@ -43,11 +49,11 @@ docker compose -f compose.deploy.yaml pull
 docker compose -f compose.deploy.yaml up -d
 ```
 
-Tags: `latest` (current main), `main`, `0.6.3` (release), `0.6` (minor), and `sha-<commit>`.
+Tags: `latest` (current main), `main`, `0.7.0` (release), `0.7` (minor), and `sha-<commit>`.
 In production, pin `DSH_SERVER_IMAGE_TAG` in `.env` to a release or sha instead of tracking `latest`:
 
 ```dotenv
-DSH_SERVER_IMAGE_TAG=0.6.3
+DSH_SERVER_IMAGE_TAG=0.7.0
 ```
 
 You can still build from source instead:

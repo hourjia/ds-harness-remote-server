@@ -17,9 +17,10 @@ import {
 } from '@dsh-remote/protocol'
 import { ApiError, Store } from './store.js'
 import { Logger, type LogLevel } from './logger.js'
-import { normalizeGatewayOptions, type GatewayTimingOptions } from './config.js'
+import { normalizeGatewayOptions, normalizeMaxFramesPerSec, type GatewayTimingOptions } from './config.js'
 
 export interface GatewayOptions extends GatewayTimingOptions {
+  maxFramesPerSec?: number
   logLevel?: LogLevel
   logger?: Logger
   /** Advertise `transport.turn` (and accept TURN credential requests). */
@@ -34,13 +35,21 @@ export interface GatewayOptions extends GatewayTimingOptions {
  */
 type ConnectionState = 'awaiting_hello' | 'authenticated' | 'closing' | 'closed'
 
-type Peer = { ws: WebSocket; id: string; role: 'host' | 'client'; capabilities: string[]; version: string; lastPong: number; nonce?: string }
+type Peer = { ws: WebSocket; id: string; role: 'host' | 'client'; capabilities: string[]; version: string; lastPong: number; pendingNonces: string[]; evictedTombstoneUntil?: number }
 type Link = { id: string; host: string; client: string; stage: 'pending' | 'accepted' | 'handshake' | 'ready'; created: number; counters: Map<string, number>; preferredTransports: TransportName[]; iceCandidates: number }
+type DroppedLink = { host: string; client: string; expiresAt: number; droppedFrames: number }
+
+/** Keep tombstones long enough for late in-flight frames to drain without CONNECTION_NOT_FOUND storms. */
+const DROPPED_LINK_TTL_MS = 300_000
+const MAX_DROPPED_LINKS_PER_HOST = 64
+const MAX_DROPPED_LINKS = 16_384
 
 /** Protocol v1 default: at most 256 ICE candidates per logical connection. */
 export const MAX_ICE_CANDIDATES_PER_CONNECTION = 256
-/** Mirrors docs/protocol.md: Clients use max(server, local) and default to 12 s. */
+/** Default fallback budget when TURN is enabled (or WebRTC is disabled). */
 const WEBRTC_FALLBACK_TIMEOUT_MS = 12_000
+/** Shorter fallback budget when only direct LAN/P2P paths are available without TURN. */
+const DIRECT_ONLY_WEBRTC_FALLBACK_TIMEOUT_MS = 3_000
 const SUPPORTED_TRANSPORTS = ['transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay'] as const
 const TRANSPORT_NAMES = ['lan', 'p2p', 'turn', 'relay'] as const
 type TransportName = (typeof TRANSPORT_NAMES)[number]
@@ -101,6 +110,7 @@ function errorCode(error: unknown): string | undefined {
 export class Gateway {
   readonly peers = new Map<string, Peer>()
   private links = new Map<string, Link>()
+  private droppedLinks = new Map<string, DroppedLink>()
   private wss = new WebSocketServer({ noServer: true, maxPayload: MAX_RELAY_FRAME_BYTES, perMessageDeflate: false })
   private heartbeat: ReturnType<typeof setInterval>
   private closed = false
@@ -109,6 +119,7 @@ export class Gateway {
   readonly heartbeatIntervalMs: number
   readonly heartbeatDisconnectMs: number
   readonly forceTerminateGraceMs: number
+  readonly maxFramesPerSec: number
   readonly logger: Logger
 
   constructor(server: Server, private store: Store, origin: string, options: GatewayOptions = {}) {
@@ -120,8 +131,11 @@ export class Gateway {
     this.heartbeatIntervalMs = timing.heartbeatIntervalMs
     this.heartbeatDisconnectMs = timing.heartbeatDisconnectMs
     this.forceTerminateGraceMs = timing.forceTerminateGraceMs
+    this.maxFramesPerSec = normalizeMaxFramesPerSec(options.maxFramesPerSec)
     this.logger = options.logger ?? new Logger('gateway', options.logLevel ?? 'info')
     this.turnEnabled = options.turnEnabled === true
+    const publicUrl = new URL(origin)
+    const portlessOrigin = publicUrl.port === '' ? undefined : `${publicUrl.protocol}//${publicUrl.hostname}`
 
     store.onInvalidate = id => this.disconnect(id, 'AUTH_INVALID')
     server.on('upgrade', (req, socket, head) => {
@@ -129,7 +143,12 @@ export class Gateway {
       // The route still requires an exact match: a query string is rejected
       // (exactly as before) but only its parsed pathname is ever logged.
       const pathRejected = req.url !== '/ws/v1/connect'
-      const originRejected = Boolean(req.headers.origin) && req.headers.origin !== origin
+      const requestOrigin = req.headers.origin
+      // HarmonyOS NetStack omits the port from its generated Origin. Browser
+      // WebSocket clients cannot set the companion header.
+      const harmonyOrigin = portlessOrigin !== undefined && requestOrigin === portlessOrigin
+        && req.headers['x-dsh-native-origin'] === origin
+      const originRejected = Boolean(requestOrigin) && requestOrigin !== origin && !harmonyOrigin
       if (pathRejected || originRejected || this.wss.clients.size >= 256) {
         this.logger.warn('ws_upgrade_rejected', {
           // Parsed pathname only: the raw URL may carry credentials in its query.
@@ -162,14 +181,90 @@ export class Gateway {
           this.disconnect(peer.id, 'CONNECTION_FAILED')
           continue
         }
-        peer.nonce = randomUUID()
-        this.send(peer, createControlFrame('ping', { nonce: peer.nonce }))
+        const nonce = randomUUID()
+        peer.pendingNonces.push(nonce)
+        if (peer.pendingNonces.length > 2) peer.pendingNonces.shift()
+        this.send(peer, createControlFrame('ping', { nonce }))
       }
       for (const link of this.links.values()) {
         if (link.stage !== 'ready' && Date.now() - link.created > 30_000) this.drop(link, 'CONNECTION_FAILED')
       }
+      this.pruneDroppedLinks(Date.now())
     }, this.heartbeatIntervalMs)
     this.heartbeat.unref()
+  }
+
+  private pruneDroppedLinks(now: number): void {
+    for (const [id, entry] of this.droppedLinks) {
+      if (entry.expiresAt <= now) this.droppedLinks.delete(id)
+    }
+  }
+
+  private evictDroppedLink(id: string, entry: DroppedLink, now: number): void {
+    this.droppedLinks.delete(id)
+    if (entry.expiresAt <= now) return
+    for (const peerId of [entry.host, entry.client]) {
+      const p = this.peers.get(peerId)
+      if (p) p.evictedTombstoneUntil = Math.max(p.evictedTombstoneUntil ?? 0, entry.expiresAt)
+    }
+  }
+
+  private recordDroppedLink(link: Link): void {
+    const now = Date.now()
+    this.pruneDroppedLinks(now)
+    this.droppedLinks.delete(link.id)
+    let hostCount = 0
+    let oldestForHost: [string, DroppedLink] | undefined
+    for (const [id, entry] of this.droppedLinks) {
+      if (entry.host === link.host) {
+        if (oldestForHost === undefined) oldestForHost = [id, entry]
+        hostCount += 1
+      }
+    }
+    if (hostCount >= MAX_DROPPED_LINKS_PER_HOST && oldestForHost !== undefined) {
+      this.evictDroppedLink(oldestForHost[0], oldestForHost[1], now)
+    }
+    while (this.droppedLinks.size >= MAX_DROPPED_LINKS) {
+      const oldest = this.droppedLinks.entries().next().value as [string, DroppedLink] | undefined
+      if (oldest === undefined) break
+      this.evictDroppedLink(oldest[0], oldest[1], now)
+    }
+    this.droppedLinks.set(link.id, {
+      host: link.host,
+      client: link.client,
+      expiresAt: now + DROPPED_LINK_TTL_MS,
+      droppedFrames: 0,
+    })
+  }
+
+  private isDroppedLinkFrame(peer: Peer, frame: ControlFrame): boolean {
+    if (frame.type === 'ping' || frame.type === 'pong' || frame.type === 'connect.request') return false
+    const p = frame.payload as Record<string, unknown>
+    const id = p.connectionId
+    if (typeof id !== 'string' || this.links.has(id)) return false
+    const now = Date.now()
+    const dropped = this.droppedLinks.get(id)
+    if (!dropped) {
+      return peer.evictedTombstoneUntil !== undefined && now < peer.evictedTombstoneUntil
+    }
+    if (dropped.expiresAt <= now) {
+      this.droppedLinks.delete(id)
+      return false
+    }
+    if (peer.id !== dropped.host && peer.id !== dropped.client) return false
+    dropped.droppedFrames += 1
+    if (dropped.droppedFrames === 1) {
+      this.logger.debug('ws_stale_link_frames_dropped', {
+        peerId: peer.id,
+        role: peer.role,
+        connectionId: safeText(id),
+      })
+    }
+    return true
+  }
+
+  droppedLinkFrameCount(connectionId: string): number {
+    return this.droppedLinks.get(connectionId)?.droppedFrames ?? 0
   }
 
   private send(peer: Peer, frame: ControlFrame): void {
@@ -179,6 +274,7 @@ export class Gateway {
   }
   private drop(link: Link, code: string): void {
     this.links.delete(link.id)
+    this.recordDroppedLink(link)
     for (const id of [link.host, link.client]) {
       const p = this.peers.get(id)
       if (p && (p.role === 'client' || modernHost(p.version))) this.send(p, createControlFrame('error', { code, message: code, connectionId: link.id, retryable: true }))
@@ -202,15 +298,20 @@ export class Gateway {
   }
 
   /**
-   * Authorize a REST `/api/v1/turn/credentials` request. Only the two devices
-   * of an active logical connection may obtain credentials, and only while
-   * that connection is still being established.
+   * Authorize a REST `/api/v1/turn/credentials` request. Only the two live
+   * devices of an active logical connection may obtain credentials: either
+   * while the connection is being established (`accepted`/`handshake`) or
+   * during an authenticated in-band transport upgrade (`ready`) when the link
+   * negotiated at least one WebRTC transport (`lan`/`p2p`/`turn`).
    */
   authorizeIce(deviceId: string, connectionId: string): boolean {
     const link = this.links.get(connectionId)
     if (link === undefined) return false
     if (link.host !== deviceId && link.client !== deviceId) return false
-    if (link.stage !== 'accepted' && link.stage !== 'handshake') return false
+    if (link.stage === 'pending') return false
+    if (link.stage === 'ready' && !link.preferredTransports.some(transport => transport !== 'relay')) {
+      return false
+    }
     return this.peers.has(link.host) && this.peers.has(link.client)
   }
   private supportedCapabilities(): string[] {
@@ -277,7 +378,7 @@ export class Gateway {
     }, this.helloTimeoutMs)
     deadline.unref()
 
-    let windowStart = Date.now(), frames = 0, bytes = 0
+    let windowStart = Date.now(), frames = 0, bytes = 0, droppedFrames = 0, droppedBytes = 0
     ws.on('error', (error) => {
       // Error messages can embed payload fragments: log the class and errno only.
       this.logger.warn('ws_socket_error', {
@@ -290,8 +391,8 @@ export class Gateway {
       state = 'closed'
       clearDeadline()
       clearGrace()
-      this.logger.debug('ws_connection_closed', {
-        peerId: peer?.id,
+      this.logger.info('ws_connection_closed', {
+        ...(peer ? { peerId: peer.id, role: peer.role } : {}),
         code,
         // The close reason is arbitrary client text: report only its presence.
         hasReason: Buffer.isBuffer(reason) ? reason.length > 0 : false,
@@ -307,8 +408,23 @@ export class Gateway {
       try {
         if (binary) throw new ApiError('INVALID_MESSAGE')
         const text = raw.toString()
-        if (Date.now() - windowStart >= 1000) { windowStart = Date.now(); frames = 0; bytes = 0 }
-        if (++frames > 512 || (bytes += Buffer.byteLength(text)) > 16 * MAX_RELAY_FRAME_BYTES) throw new ApiError('RATE_LIMITED')
+        const frameBytes = Buffer.byteLength(text)
+        if (Date.now() - windowStart >= 1000) {
+          windowStart = Date.now()
+          frames = 0
+          bytes = 0
+          droppedFrames = 0
+          droppedBytes = 0
+        }
+        const maxDroppedFrames = Math.max(this.maxFramesPerSec * 2, 1024)
+        const maxDroppedBytes = 8 * MAX_RELAY_FRAME_BYTES
+        if (frames + droppedFrames + 1 > this.maxFramesPerSec + maxDroppedFrames
+          || bytes + droppedBytes + frameBytes > 16 * MAX_RELAY_FRAME_BYTES + maxDroppedBytes) {
+          throw new ApiError('RATE_LIMITED')
+        }
+        if (state === 'awaiting_hello' && (++frames > this.maxFramesPerSec || (bytes += frameBytes) > 16 * MAX_RELAY_FRAME_BYTES)) {
+          throw new ApiError('RATE_LIMITED')
+        }
         const envelope = JSON.parse(text) as { v?: unknown }
         if (envelope && envelope.v !== 1) throw new ApiError('UNSUPPORTED_VERSION')
         frame = decodeControlFrame(text)
@@ -327,7 +443,7 @@ export class Gateway {
           // Keep the negotiated set (what hello.ack advertises), so a link can
           // never coordinate a transport this Server did not offer — e.g. TURN
           // while no TURN deployment is configured.
-          peer = { ws, id: device.deviceId, role: device.role, capabilities: this.negotiatedCapabilities(p.capabilities), version: p.clientVersion ?? device.clientVersion, lastPong: Date.now() }
+          peer = { ws, id: device.deviceId, role: device.role, capabilities: this.negotiatedCapabilities(p.capabilities), version: p.clientVersion ?? device.clientVersion, lastPong: Date.now(), pendingNonces: [] }
           this.peers.set(peer.id, peer)
           this.store.touch(peer.id, p.clientVersion, p.harnessVersion)
           this.logger.info('ws_hello_authenticated', {
@@ -336,6 +452,11 @@ export class Gateway {
             clientVersion: safeText(peer.version),
             capabilities: peer.capabilities.filter(capability => typeof capability === 'string' && SAFE_TEXT.test(capability)).slice(0, 8),
           })
+          const webrtcEnabled = peer.capabilities.some(capability =>
+            capability === 'transport.lan' || capability === 'transport.p2p' || capability === 'transport.turn')
+          const webrtcFallbackTimeoutMs = webrtcEnabled && !this.turnEnabled
+            ? DIRECT_ONLY_WEBRTC_FALLBACK_TIMEOUT_MS
+            : WEBRTC_FALLBACK_TIMEOUT_MS
           this.send(peer, createControlFrame('hello.ack', {
             protocol: 1,
             serverVersion: 'self-hosted/0.1.0',
@@ -343,15 +464,24 @@ export class Gateway {
             heartbeatIntervalMs: this.heartbeatIntervalMs,
             maxControlFrameBytes: MAX_CONTROL_FRAME_BYTES,
             maxRelayFrameBytes: MAX_RELAY_FRAME_BYTES,
-            capabilities: this.negotiatedCapabilities(p.capabilities),
-            webrtcEnabled: true,
-            webrtcFallbackTimeoutMs: WEBRTC_FALLBACK_TIMEOUT_MS,
+            capabilities: peer.capabilities,
+            webrtcEnabled,
+            webrtcFallbackTimeoutMs,
           }))
           return
         }
         if (frame.type === 'hello') throw new ApiError('INVALID_MESSAGE')
         if (!peer || this.peers.get(peer.id) !== peer) throw new ApiError('AUTH_INVALID')
         this.store.get(peer.id)
+        if (this.isDroppedLinkFrame(peer, frame)) {
+          if (++droppedFrames > maxDroppedFrames || (droppedBytes += frameBytes) > maxDroppedBytes) {
+            throw new ApiError('RATE_LIMITED')
+          }
+          return
+        }
+        if (++frames > this.maxFramesPerSec || (bytes += frameBytes) > 16 * MAX_RELAY_FRAME_BYTES) {
+          throw new ApiError('RATE_LIMITED')
+        }
         this.handle(peer, frame)
       } catch (error) {
         const code = error instanceof ApiError ? error.code : 'INVALID_MESSAGE'
@@ -386,12 +516,30 @@ export class Gateway {
     const p = frame.payload as Record<string, unknown>
     if (frame.type === 'ping') { this.send(peer, createControlFrame('pong', { nonce: p.nonce })); return }
     if (frame.type === 'pong') {
-      if (peer.nonce && p.nonce === peer.nonce) { peer.lastPong = Date.now(); peer.nonce = undefined }
+      const nonce = typeof p.nonce === 'string' ? p.nonce : undefined
+      if (nonce !== undefined) {
+        const index = peer.pendingNonces.indexOf(nonce)
+        if (index !== -1) {
+          peer.lastPong = Date.now()
+          peer.pendingNonces.splice(0, index + 1)
+        }
+      }
       return
     }
     if (frame.type === 'connect.request') {
       const request = frame.payload as ConnectRequestPayload
       if (peer.role !== 'client') throw new ApiError('MEMBERSHIP_REQUIRED')
+      const candidateHost = this.peers.get(request.hostDeviceId)
+      if (candidateHost && Date.now() - candidateHost.lastPong > this.heartbeatDisconnectMs) {
+        this.logger.warn('ws_heartbeat_timeout', {
+          peerId: candidateHost.id,
+          role: candidateHost.role,
+          lastPong: candidateHost.lastPong,
+          elapsedMs: Date.now() - candidateHost.lastPong,
+          thresholdMs: this.heartbeatDisconnectMs,
+        })
+        this.disconnect(candidateHost.id, 'CONNECTION_FAILED')
+      }
       const host = this.peers.get(request.hostDeviceId)
       if (!host || host.role !== 'host') { this.send(peer, createControlFrame('error', { code: 'HOST_OFFLINE', message: 'Host is offline.', retryable: true })); return }
       const clientDevice = this.store.get(peer.id)
@@ -441,7 +589,10 @@ export class Gateway {
     if (!other) throw new ApiError('CONNECTION_FAILED')
     if (frame.type === 'connect.accepted' || frame.type === 'connect.rejected') {
       if (peer.id !== link.host || link.stage !== 'pending') throw new ApiError('INVALID_MESSAGE')
-      if (frame.type === 'connect.rejected') this.links.delete(link.id)
+      if (frame.type === 'connect.rejected') {
+        this.links.delete(link.id)
+        this.recordDroppedLink(link)
+      }
       else link.stage = 'accepted'
       this.send(other, frame)
       return
@@ -521,6 +672,10 @@ export class Gateway {
     this.closed = true
     clearInterval(this.heartbeat)
     this.logger.info('ws_gateway_closing', { clientCount: this.wss.clients.size })
+    // A planned shutdown must not report each closing peer as CONNECTION_FAILED.
+    this.peers.clear()
+    this.links.clear()
+    this.droppedLinks.clear()
     for (const ws of this.wss.clients) {
       // Give resumable clients an explicit, unambiguous shutdown signal. A
       // process restart is different from heartbeat failure (4001) and from

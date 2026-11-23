@@ -1,10 +1,16 @@
 {
   "name": "ds-harness-remote-server",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "description": "Self-hosted Relay/C signaling server for DeepSeek Harness Remote: device registration, WebRTC coordination, and end-to-end encrypted relay.",
   "license": "MIT",
   "type": "module",
   "private": true,
+  "upstream": {
+    "repository": "https://github.com/liguobao/ds-harness-remote",
+    "tag": "v0.6.7",
+    "commit": "d026990",
+    "syncedAt": "2026-11-23"
+  },
   "packageManager": "pnpm@9.15.4",
   "engines": {
     "node": ">=22"

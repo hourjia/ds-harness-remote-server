@@ -10,6 +10,12 @@
 
 首页地址是 `/`，点击“开始使用”进入登录页；登录成功后进入 `/app/remote` 设备列表，只显示当前账号拥有的设备。Host 和客户端都填写同一个 Server 地址，且必须使用**同一账号**登录。
 
+## 刷新响应恢复
+
+refresh 成功但响应丢失时，用旧 refresh token 重试会拿回同一后继 pair，Server 重启后依然有效。恢复能力保持到该后继 token 再次轮换、被撤销或过期为止，并且不延长任何 token 的生命周期；恢复出的 access token 若已过期，可用恢复的 refresh token 正常轮换。更早的 token 被拒绝，但不会撤销当前有效凭据。
+
+升级前已被消耗的旧 token 没有恢复元数据，无法恢复；被撤销或过期的凭据仍要求重新登录。恢复元数据不包含明文 bearer，详见[协议 refresh 章节](../../docs/protocol.md)。
+
 ## 多账号
 
 默认仍是单账号：设置 `DSH_SERVER_ACCOUNT` + `DSH_SERVER_PASSWORD` 即可，行为与之前一致。
@@ -44,11 +50,11 @@ docker compose -f compose.deploy.yaml pull
 docker compose -f compose.deploy.yaml up -d
 ```
 
-镜像标签：`latest`（main 最新）、`main`、`0.6.3` 形式的版本号、`0.6` 次要版本、`sha-<commit>`。
+镜像标签：`latest`（main 最新）、`main`、`0.7.0` 形式的版本号、`0.7` 次要版本、`sha-<commit>`。
 生产环境建议在 `.env` 里把 `DSH_SERVER_IMAGE_TAG` 固定到具体版本或 sha，不要跟 `latest`：
 
 ```dotenv
-DSH_SERVER_IMAGE_TAG=0.6.3
+DSH_SERVER_IMAGE_TAG=0.7.0
 ```
 
 也可以从源码本地构建：

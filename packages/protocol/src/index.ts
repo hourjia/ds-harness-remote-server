@@ -1,5 +1,30 @@
+export { LAN_UPLOAD_CAPABILITY, LAN_UPLOAD_MIN_BYTES, LAN_UPLOAD_TICKET_MS, LAN_UPLOAD_CONNECT_MS, lanUploadScopeSchema, lanUploadRequestSchema, lanUploadOfferSchema, isLanUploadAddress, validateLanUploadOffer, createLanUploadPrologue, type LanUploadOffer } from './lan-upload.js'
+export {
+  TRANSPORT_UPGRADE_CAPABILITY,
+  UPGRADE_SEQUENCE_HEADER_BYTES,
+  MAX_REORDER_BUFFERED_FRAMES,
+  MAX_REORDER_BUFFERED_BYTES,
+  DEFAULT_REORDER_GAP_TIMEOUT_MS,
+  DEFAULT_PREVIOUS_LEG_DRAIN_MS,
+  transportUpgradeCandidateSchema,
+  transportUpgradeOfferSchema,
+  transportUpgradeIceSchema,
+  transportUpgradeActivateSchema,
+  transportUpgradeDrainSchema,
+  transportUpgradeAbortSchema,
+  transportTierRank,
+  wireFromTransportTier,
+  wrapUpgradedTransportFrame,
+  unwrapUpgradedTransportFrame,
+  SequencedCiphertextReorderBuffer,
+  type TransportTier,
+} from './transport-upgrade.js'
+import { encodeBinaryUpload, decodeBinaryUpload } from './binary-upload.js'
+export { BINARY_UPLOAD_CAPABILITY, BINARY_UPLOAD_CHUNK_BYTES } from './binary-upload.js'
 export * from './loopback.js'
 import { parseWireJson } from './wire-json.js'
+export { parseWireJson } from './wire-json.js'
+import { WORKSPACE_GIT_METHODS } from './workspace-git.js'
 import { z } from 'zod'
 
 export const WEBRTC_RESUME_CAPABILITY = 'transport.webrtc.resume.v1'
@@ -109,6 +134,40 @@ export interface AcpSessionModels {
   groups: Array<{ id: string; name: string; models: Array<{ id: string; name: string; reasoning?: { efforts: Array<{ id: string; name: string }>; defaultEffort?: string } }> }>;
   failures: Array<{ id: string; name: string; message: string }>;
 }
+export interface AcpModeOption { id: string; name: string; description?: string }
+export interface AcpSessionModes { currentModeId?: string; availableModes: AcpModeOption[] }
+export interface AcpAvailableCommand { name: string; description?: string; input?: { hint?: string } }
+export interface AcpAuthMethod {
+  id: string
+  name: string
+  description?: string
+  type?: 'terminal' | (string & {})
+  args?: string[]
+}
+export interface AcpAuthDiagnostic {
+  authStatus: 'authenticated' | 'auth_required' | 'unknown'
+  errorCode?: string
+  guidance?: string
+  loginCommand?: string
+  loginUrl?: string
+  authMethods?: AcpAuthMethod[]
+}
+export interface AcpUsageSummary {
+  inputTokens?: number
+  outputTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
+  totalTokens?: number
+}
+export interface AcpContextUsage { used: number; size: number }
+export interface AcpWorkspaceRecord {
+  path: string
+  title?: string
+  sessionCount?: number
+  order?: number
+  updatedAt?: string
+}
 export const MAX_ACP_PROMPT_BYTES = 64 * 1024
 export const MAX_ACP_UPDATE_BYTES = 512 * 1024
 
@@ -145,12 +204,31 @@ export const controlFrameTypes = [
   'error',
 ] as const
 
+export const sessionTransferMethods = [
+  'session.transfer.export.open',
+  'session.transfer.export.read',
+  'session.transfer.export.close',
+  'session.transfer.import.open',
+  'session.transfer.import.chunk',
+  'session.transfer.import.commit',
+  'session.transfer.import.status',
+  'session.transfer.import.abort',
+] as const
+
 export const rpcMethods = [
+  ...sessionTransferMethods,
+  ...WORKSPACE_GIT_METHODS,
+  'workspace.upload.lan.open',
   'workspace.upload.open',
   'workspace.upload.chunk',
+  'workspace.upload.chunk.binary',
   'workspace.upload.commit',
   'workspace.upload.abort',
   'harness.transport.describe',
+  'dsh.web.open',
+  'dsh.web.close',
+  'dsh.web.lan.direct.open',
+  'dsh.web.lan.direct.close',
   'remote.history.configure',
   'harness.api.call',
   'harness.api.transfer.open',
@@ -169,6 +247,9 @@ export const rpcMethods = [
   'harness.remote.transfer.close',
   'harness.remote.stream.open',
   'harness.remote.stream.close',
+  'harness.remote.compaction.submit',
+  'harness.remote.compaction.status',
+  'harness.remote.compaction.cancel',
   'loopback.call',
   'fileviewer.call',
   'codex.app.call',
@@ -212,6 +293,7 @@ export const remoteEvents = [
   'acp.session.update',
   'acp.session.request_permission',
   'acp.session.closed',
+  'remote.transport.upgrade.ice',
 ] as const
 
 export const errorCodes = [
@@ -398,6 +480,8 @@ export interface ConnectIncomingPayload {
 }
 
 export interface ConnectAcceptedPayload {
+  webrtcFallbackTimeoutMs?: number
+  parallelConnections?: boolean
   relayRecoveryTicket?: string
   recoveryTicket?: string
   connectionId: string
@@ -491,8 +575,13 @@ export const transportCapabilities = [
  * harness.remote.v3); advertising both is a protocol violation.
  */
 export const harnessCapabilityValues = [
+  'session.transfer.export.v1',
+  'session.transfer.import.v1',
   'remote.history.compact.v1',
+  'remote.compaction.async.v1',
+  'remote.session.events.v1',
   'workspace.upload.v1',
+  'workspace.upload.binary.v1',
   'harness.api.v1',
   'harness.api.transfer.v1',
   'harness.remote.v1',
@@ -724,6 +813,67 @@ export interface HarnessRemoteStreamClosedData {
   }
 }
 
+/**
+ * Remote-owned asynchronous compaction contract.
+ *
+ * Harness `commands/execute('/compact')` legitimately waits for the whole
+ * summarization, which can take minutes on slow local inference backends. The
+ * Remote bridge therefore registers the operation on the Host and returns
+ * immediately; the command keeps running on the Host runtime even when the
+ * submitting client disconnects. Clients observe the operation through
+ * `harness.remote.compaction.status` and the ordinary Session event stream.
+ *
+ * Every result is settled by the Host's own background call: a
+ * `compaction/end` event never fabricates success.
+ */
+export const REMOTE_COMPACTION_CAPABILITY = 'remote.compaction.async.v1'
+export const REMOTE_SESSION_EVENTS_CAPABILITY = 'remote.session.events.v1'
+
+/** Operation states visible to Remote clients. */
+export type RemoteCompactionState =
+  | 'accepted'
+  | 'running'
+  | 'cancelling'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
+  /** The run committed, but cancellation/timing hid the final persistence result. */
+  | 'unconfirmed'
+
+export interface RemoteCompactionSubmitParams {
+  sessionId: string
+  /** Client-chosen idempotency key; retrying the same id never starts a second run. */
+  requestId: string
+  /**
+   * Wall-clock budget for the compaction task itself, independent of any RPC
+   * deadline. Hosts clamp it to [60_000, 7_200_000]; the default is 30 minutes.
+   */
+  budgetMs?: number
+}
+
+export interface RemoteCompactionSubmitResult {
+  operationId: string
+  state: RemoteCompactionState
+}
+
+export interface RemoteCompactionStatusParams {
+  sessionId: string
+  operationId: string
+}
+
+export interface RemoteCompactionStatusResult {
+  operationId: string
+  sessionId: string
+  state: RemoteCompactionState
+  /** Epoch ms when the Host accepted the operation; absent when the Host lost it. */
+  acceptedAt?: number
+  startedAt?: number
+  finishedAt?: number
+  /** Human-readable outcome detail; never a substituted success. */
+  message?: string
+}
+
 export interface RemoteWorkspaceTypeDescription {
   id: string
   name: string
@@ -739,6 +889,8 @@ export interface RemoteHistoryConfigureParams {
 export interface HarnessTransportDescription {
   capabilities: string[]
   workspaceTypes?: RemoteWorkspaceTypeDescription[]
+  sameLinkIpv6Endpoints?: string[]
+  sameLinkIpv6PairProbe?: true
 }
 
 export type CodexPermissionPreset = 'workspace-write' | 'danger-full-access'
@@ -825,13 +977,13 @@ export interface AgentAcpRespondParams {
 export type AcpWorkspaceToolCallEndpoint = 'workspaceFiles/list' | 'workspaceFiles/stat' | 'workspaceFiles/read' | 'workspaceFiles/readBytes' | 'workspaceFiles/readAll'
   | 'terminal/environment' | 'terminal/shells' | 'terminal/list' | 'terminal/create' | 'terminal/write' | 'terminal/resize' | 'terminal/rename' | 'terminal/close'
 export type AcpWorkspaceToolStreamEndpoint = 'workspaceFiles/changes' | 'terminal/follow' | 'terminal/retain'
-export interface AcpWorkspaceToolParams { sessionId: string; backend: 'cursor' | 'antigravity' | 'pi' | 'opencode' | 'claude' | 'hermes'; endpoint: AcpWorkspaceToolCallEndpoint; args: Record<string, unknown> }
-export interface AcpModelParams { sessionId: string; backend: 'cursor' | 'claude' | 'antigravity' | 'pi' | 'opencode' }
+export interface AcpWorkspaceToolParams { sessionId: string; backend: AcpBackend; endpoint: AcpWorkspaceToolCallEndpoint; args: Record<string, unknown> }
+export interface AcpModelParams { sessionId: string; backend: AcpBackend }
 export interface AcpModelSelectionParams extends AcpModelParams { model: string; reasoningEffort?: string }
 export interface AgentAcpStreamOpenParams {
   streamId: string
   sessionId: string
-  tool?: { backend: 'cursor' | 'antigravity' | 'pi' | 'opencode' | 'claude' | 'hermes'; endpoint: AcpWorkspaceToolStreamEndpoint; args: Record<string, unknown> }
+  tool?: { backend: AcpBackend; endpoint: AcpWorkspaceToolStreamEndpoint; args: Record<string, unknown> }
 }
 
 export interface AgentAcpStreamCloseParams {
@@ -1103,6 +1255,8 @@ export const connectIncomingPayloadSchema = z.object({
 })
 
 export const connectAcceptedPayloadSchema = z.object({
+  webrtcFallbackTimeoutMs: z.number().int().positive().max(2_147_483_647).optional(),
+  parallelConnections: z.boolean().optional(),
   relayRecoveryTicket: z.string().min(1).max(4096).optional(),
   recoveryTicket: z.string().min(1).max(4096).optional(),
   connectionId: z.string().min(1),
@@ -1325,7 +1479,7 @@ export function encodeRelayDataFrame(
   frame: RelayDataFrame,
   limits: ControlFrameByteLimits = {},
 ): string {
-  const parsed = relayDataFrameSchema.parse(frame)
+  const parsed = parseRelayDataFrame(frame)
   const encoded = JSON.stringify(parsed)
   assertControlFrameSize(new TextEncoder().encode(encoded).byteLength, 'relay', limits)
   return encoded
@@ -1338,18 +1492,25 @@ export function decodeRelayDataFrame(
   const encoded = typeof data === 'string' ? new TextEncoder().encode(data) : data
   assertControlFrameSize(encoded.byteLength, 'relay', limits)
   try {
-    return relayDataFrameSchema.parse(parseWireJson(data))
+    return parseRelayDataFrame(parseWireJson(data))
   } catch {
     throw new Error('Invalid Relay data frame.')
   }
 }
 
+function parseRelayDataFrame(input: unknown): RelayDataFrame {
+  const frame = relayDataFrameSchema.parse(input)
+  if (frame.type === 'relay') return { ...frame, payload: relayPayloadSchema.parse(frame.payload) }
+  if (frame.type === 'secure.handshake') return { ...frame, payload: secureHandshakePayloadSchema.parse(frame.payload) }
+  return frame
+}
+
 export function encodeMessage(message: RemoteMessage): Uint8Array {
-  return new TextEncoder().encode(JSON.stringify(message))
+  return encodeBinaryUpload(message) ?? new TextEncoder().encode(JSON.stringify(message))
 }
 
 export function decodeMessage(data: Uint8Array | string): RemoteMessage {
-  return parseRemoteMessage(parseWireJson(data))
+  return parseRemoteMessage(decodeBinaryUpload(data) ?? parseWireJson(data))
 }
 
 interface FragmentAssembly {
@@ -1470,3 +1631,6 @@ function cryptoRandomId(): string {
   if (g?.randomUUID) return g.randomUUID()
   return `msg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
 }
+
+export * from './dsh-web.js'
+export * from './workspace-git.js'
