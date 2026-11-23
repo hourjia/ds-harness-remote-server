@@ -83,4 +83,4 @@
    注意先统一换行（CRLF/LF 混用会让合并整文件冲突）。
 4. 预期需要手改的位置只有：`server.ts` 的 import 段、`store.ts` 的 schema 段与 `issue()`/`refresh()`、`gateway.ts` 的 `connect.request` 账号校验。
 5. `pnpm build && pnpm -r check && pnpm -r test`；上游改了既有行为时，同步更新本仓库对应断言（别把上游有意的行为变更当回归）。
-6. 更新 `package.json` 的 `upstream` 字段、上面两张表，并自增本仓库版本号。
+6. 更新 `package.json` 的 `upstream` 字段、上面两张表，并自增本仓库版本号（发版方式见 [release.md](./release.md)）。

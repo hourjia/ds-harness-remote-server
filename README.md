@@ -89,10 +89,16 @@ node --env-file=.env dist/main.js
 
 打开 <http://localhost:8080>，Host 与客户端填写同一地址、同一账号密码登录。
 
-## Docker
+## 发版与镜像
 
-推送到 `main` 或打 `v*` tag 后，GitHub Actions 自动构建并推送镜像到
-`ghcr.io/hourjia/ds-harness-remote-server`。在服务器上拉取预构建镜像部署：
+镜像发布由**提交标题**触发，不再依赖 `git tag`：只有标题为 `tag:<version>`（如
+`tag:0.7.1`）且与 `package.json` 版本一致的提交，才会构建并推送镜像；普通提交只跑校验。
+镜像标签为精确版本、`<major>.<minor>`、`latest` 和 `sha-<commit>`（预发布版本不动
+`latest` 与 minor 标签）。完整流程与失败处理见 [`docs/release.md`](./docs/release.md)。
+
+### 用预构建镜像部署
+
+在服务器上拉取镜像：
 
 ```bash
 cd apps/server
@@ -105,7 +111,7 @@ docker compose -f compose.deploy.yaml up -d
 数据保存在 `server-data` 卷。生产环境建议在 `.env` 中把 `DSH_SERVER_IMAGE_TAG` 固定到
 具体版本（如 `0.7.0`）或 `sha-<commit>`，不要跟 `latest`。
 
-从源码本地构建仍可用：
+### 从源码本地构建
 
 ```bash
 cd apps/server

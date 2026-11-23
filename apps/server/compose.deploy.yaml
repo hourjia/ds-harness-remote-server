@@ -8,7 +8,7 @@
 #   docker compose -f compose.deploy.yaml up -d
 #
 # Pin a release by setting DSH_SERVER_IMAGE_TAG (e.g. 0.7.0 or sha-abc1234)
-# instead of tracking latest.
+# instead of tracking latest. `latest` only moves when a release commit titled `tag:<version>` lands on main.
 services:
   server:
     image: ghcr.io/hourjia/ds-harness-remote-server:${DSH_SERVER_IMAGE_TAG:-latest}

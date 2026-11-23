@@ -26,6 +26,7 @@
 | 文档 | 内容 |
 |---|---|
 | [upstream-sync.md](./upstream-sync.md) | 上游基线（tag / commit）与每次同步的范围、明细 |
+| [release.md](./release.md) | 发版：`tag:<version>` 提交触发、镜像标签、排错 |
 | [plugin-integration.md](./plugin-integration.md) | Host 插件接入指南：注册、凭据、连接、allowlist 边界 |
 | [remote-tools.md](./remote-tools.md) | `remote_*` Agent 工具的语义与启用条件 |
 | [design/webrtc-control-recovery.md](./design/webrtc-control-recovery.md) | 可选增量契约 `transport.webrtc.resume.v1`：控制面恢复 |

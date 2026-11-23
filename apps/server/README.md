@@ -49,7 +49,7 @@ docker compose -f compose.deploy.yaml pull
 docker compose -f compose.deploy.yaml up -d
 ```
 
-Tags: `latest` (current main), `main`, `0.7.0` (release), `0.7` (minor), and `sha-<commit>`.
+Tags: `0.7.0` (exact release), `0.7` (minor), `latest` (current stable release), and `sha-<commit>`. Images are published only by release commits titled `tag:<version>`; ordinary pushes never move `latest`.
 In production, pin `DSH_SERVER_IMAGE_TAG` in `.env` to a release or sha instead of tracking `latest`:
 
 ```dotenv
